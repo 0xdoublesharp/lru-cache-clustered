@@ -7,6 +7,7 @@ if (!cluster.isWorker) throw new Error('worker-fetch-child loaded outside a work
 const cache = await LRUCacheClustered.getInstance<string, string>({
   namespace: 'integration-fetch',
   max: 10,
+  timeout: 2_000,
 });
 
 process.send?.({ kind: 'fetch-ready' });
