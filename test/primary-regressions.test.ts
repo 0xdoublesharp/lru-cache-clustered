@@ -226,3 +226,143 @@ void test('existingOnly get does not recreate a destroyed namespace', () => {
   assert.equal(response.value, undefined);
   assert.equal(caches.has(namespace), false);
 });
+
+void test('fetchRelease clears a timed-out leader lock by ownerRequestId', () => {
+  const namespace = 'primary-fetch-release-leader';
+  try {
+    const first = request(namespace, 'fetchClaim', { key: 'key', requestId: 'req-leader' });
+    assert.ok(first.ok);
+    const firstVal = first.value as { kind: string; token: string };
+    assert.equal(firstVal.kind, 'leader');
+
+    // Simulate worker IPC timeout on fetchClaim: worker never received the token
+    // and only sends fetchRelease with its requestId.
+    const released = request(namespace, 'fetchRelease', { key: 'key', requestId: 'req-leader' });
+    assert.ok(released.ok);
+    assert.equal(released.value, true, 'fetchRelease must release a leader lock owned by requestId');
+
+    // Another caller must immediately be able to claim leadership without waiting 30s.
+    const next = request(namespace, 'fetchClaim', { key: 'key', requestId: 'req-next' });
+    assert.ok(next.ok);
+    assert.equal((next.value as { kind: string }).kind, 'leader');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('load does not mutate caller dump entries across repeated primary-mode loads', () => {
+  const srcNs = 'primary-load-immut-src';
+  const dstA = 'primary-load-immut-a';
+  const dstB = 'primary-load-immut-b';
+  try {
+    request(srcNs, 'init', { options: { max: 10, ttl: 60_000 } });
+    request(srcNs, 'set', { key: 'k', value: 'v', ttl: 60_000 });
+    const dumpResp = request(srcNs, 'dump');
+    assert.ok(dumpResp.ok);
+    const dump = dumpResp.value as Array<[string, { value: string; ttl?: number; start?: number }]>;
+    const originalStart = dump[0]?.[1].start;
+    assert.equal(typeof originalStart, 'number');
+
+    request(dstA, 'init', { options: { max: 10, ttl: 60_000 } });
+    request(dstB, 'init', { options: { max: 10, ttl: 60_000 } });
+
+    assert.equal(request(dstA, 'load', { entries: dump }).ok, true);
+    assert.equal(dump[0]?.[1].start, originalStart, 'load must not mutate caller entry.start in place');
+    assert.equal(request(dstB, 'load', { entries: dump }).ok, true);
+
+    assert.equal((request(dstA, 'get', { key: 'k' }) as { value: unknown }).value, 'v');
+    assert.equal((request(dstB, 'get', { key: 'k' }) as { value: unknown }).value, 'v');
+    const remB = (request(dstB, 'getRemainingTTL', { key: 'k' }) as { value: number }).value;
+    assert.ok(remB > 0 && remB <= 60_000, `expected positive remaining TTL on second load, got ${remB}`);
+  } finally {
+    request(srcNs, 'destroy');
+    request(dstA, 'destroy');
+    request(dstB, 'destroy');
+  }
+});
+
+void test('load rejects nullish entry metadata cleanly', () => {
+  const namespace = 'primary-load-null-entry';
+  try {
+    request(namespace, 'init', { options: { max: 10 } });
+    const resp = request(namespace, 'load', { entries: [['k', null]] });
+    assert.equal(resp.ok, false);
+    if (!resp.ok) assert.match(resp.error.message, /cache entry must not be null or undefined/);
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('destroy and max rebuild clear discarded caches so autopurge timers are released', () => {
+  const namespace = 'primary-clear-discarded';
+  try {
+    request(namespace, 'init', { options: { max: 5, ttl: 60_000, ttlAutopurge: true } });
+    request(namespace, 'set', { key: 'a', value: 1 });
+    const initialCache = caches.get(namespace);
+    assert.ok(initialCache);
+    assert.equal(initialCache.size, 1);
+
+    request(namespace, 'max', { value: 10 });
+    assert.equal(initialCache.size, 0, 'max rebuild must clear the replaced cache and its timers');
+    const rebuiltCache = caches.get(namespace);
+    assert.ok(rebuiltCache);
+    assert.notEqual(rebuiltCache, initialCache);
+    assert.equal(rebuiltCache.size, 1);
+
+    request(namespace, 'destroy');
+    assert.equal(rebuiltCache.size, 0, 'destroy must clear the removed cache and its timers');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('ttl setter validates nonnegative integers and prevents unbounding a ttl-only cache', () => {
+  const boundedNs = 'primary-ttl-validate-bounded';
+  const ttlOnlyNs = 'primary-ttl-validate-only';
+  try {
+    request(boundedNs, 'init', { options: { max: 10, ttl: 1000 } });
+    for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const resp = request(boundedNs, 'ttl', { value: bad });
+      assert.equal(resp.ok, false, `expected ttl=${String(bad)} to be rejected`);
+    }
+    // 0 is allowed when max > 0 (disables default TTL).
+    const zeroOk = request(boundedNs, 'ttl', { value: 0 });
+    assert.equal(zeroOk.ok, true);
+    assert.equal((zeroOk as { value: number }).value, 0);
+
+    // 0 must be rejected when neither max nor maxSize is set.
+    request(ttlOnlyNs, 'init', { options: { ttl: 1000, ttlAutopurge: true } });
+    const zeroUnbounded = request(ttlOnlyNs, 'ttl', { value: 0 });
+    assert.equal(zeroUnbounded.ok, false);
+  } finally {
+    request(boundedNs, 'destroy');
+    request(ttlOnlyNs, 'destroy');
+  }
+});
+
+void test('polling followers do not inflate primary miss stats on repeated poll cycles', () => {
+  const namespace = 'primary-follower-poll-misses';
+  try {
+    request(namespace, 'init', { options: { max: 10 } });
+    const leader = request(namespace, 'fetchClaim', { key: 'k', requestId: 'leader' });
+    assert.ok(leader.ok);
+    const firstFollow = request(namespace, 'fetchClaim', { key: 'k', requestId: 'f1' });
+    assert.ok(firstFollow.ok);
+    const generation = (firstFollow.value as { generation: string }).generation;
+    // Simulate 5 poll retries from the same follower.
+    for (let i = 0; i < 5; i++) {
+      const poll = request(namespace, 'fetchClaim', { key: 'k', requestId: 'f1', generation });
+      assert.ok(poll.ok);
+      assert.equal((poll.value as { kind: string }).kind, 'follower');
+    }
+    const statsResp = request(namespace, 'stats');
+    assert.ok(statsResp.ok);
+    assert.equal(
+      (statsResp.value as { misses: number }).misses,
+      2,
+      'only initial misses (leader + first follower lookup) should count toward misses',
+    );
+  } finally {
+    request(namespace, 'destroy');
+  }
+});

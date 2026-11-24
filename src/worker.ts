@@ -5,6 +5,7 @@ import {
   SOURCE,
   deserializeError,
   isInvalidationPush,
+  isOurMessage,
   type InvalidationPush,
   type Request,
   type DispatchResult,
@@ -135,20 +136,14 @@ export function createIpcClient(proc: ProcessLike): IpcClient {
 }
 
 function isOurResponse(value: unknown): value is Response {
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    (value as { source?: unknown }).source !== SOURCE ||
-    typeof (value as { id?: unknown }).id !== 'string' ||
-    typeof (value as { ok?: unknown }).ok !== 'boolean'
-  ) {
+  if (!isOurMessage(value) || typeof value.id !== 'string' || typeof value.ok !== 'boolean') {
     return false;
   }
   // When ok=false, validate the error payload shape too. Without this guard a
   // malformed error from a misbehaving primary would crash the message
   // listener in deserializeError(undefined) and take the worker down.
-  if ((value as { ok: boolean }).ok === false) {
-    let error: unknown = (value as { error?: unknown }).error;
+  if (value.ok === false) {
+    let error: unknown = value.error;
     // serializeError emits at most eight causes plus the root. Bound the
     // entire chain, including cycles, before recursive reconstruction.
     for (let depth = 0; ; depth++) {

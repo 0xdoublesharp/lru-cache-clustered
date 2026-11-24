@@ -149,16 +149,13 @@ export type InvalidationPush =
   | { source: Source; push: 'l1:invalidate'; namespace: string; key: unknown; version: number }
   | { source: Source; push: 'l1:invalidate-namespace'; namespace: string; version: number };
 
+export function isOurMessage(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && (value as { source?: unknown }).source === SOURCE;
+}
+
 export function isInvalidationPush(value: unknown): value is InvalidationPush {
-  if (
-    typeof value !== 'object' ||
-    value === null ||
-    (value as { source?: unknown }).source !== SOURCE ||
-    typeof (value as { namespace?: unknown }).namespace !== 'string' ||
-    typeof (value as { version?: unknown }).version !== 'number'
-  ) {
+  if (!isOurMessage(value) || typeof value.namespace !== 'string' || typeof value.version !== 'number') {
     return false;
   }
-  const push = (value as { push?: unknown }).push;
-  return push === 'l1:invalidate' || push === 'l1:invalidate-namespace';
+  return value.push === 'l1:invalidate' || value.push === 'l1:invalidate-namespace';
 }

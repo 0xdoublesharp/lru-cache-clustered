@@ -202,3 +202,63 @@ void test('disconnected followers cannot retain an idle fetch group', async () =
   );
   dispatchOp(namespace, { op: 'destroy' });
 });
+
+void test('promoted follower superseded by aborted forceRefresh releases its follower registration', async () => {
+  const namespace = 'follower-promoted-force-refresh-abort';
+  const c1 = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  const c2 = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  const c3 = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  const c1Started = deferred();
+  const c1Gate = deferred();
+  const c3Started = deferred();
+  const c3Gate = deferred();
+  const state = (globalThis as Record<PropertyKey, unknown>)[Symbol.for('lru-cache-clustered.primary')] as {
+    fetchLocks: Map<string, Map<unknown, unknown>>;
+  };
+  try {
+    const p1 = c1
+      .fetch('key', async () => {
+        c1Started.resolve();
+        await c1Gate.promise;
+        throw new Error('c1 failed');
+      })
+      .catch((e: unknown) => e);
+    await c1Started.promise;
+
+    // c3 joins as follower, then takes over leadership when c1 aborts.
+    const p3 = c3
+      .fetch('key', async () => {
+        c3Started.resolve();
+        await c3Gate.promise;
+        return 'c3-stale';
+      })
+      .catch((e: unknown) => e);
+    await setImmediate();
+    c1Gate.resolve();
+    await p1;
+    await c3Started.promise;
+
+    // c2 force-refreshes (superseding c3's token while preserving the generation) and aborts.
+    await assert.rejects(
+      c2.fetch(
+        'key',
+        () => {
+          throw new Error('c2 failed');
+        },
+        { forceRefresh: true },
+      ),
+      /c2 failed/,
+    );
+
+    // c3 finishes its fetch, sees fetchStore=false, and its finally block must release its follower slot.
+    c3Gate.resolve();
+    const r3 = await p3;
+    assert.ok(r3 instanceof Error);
+    assert.match(r3.message, /superseded.*no current value/i);
+    assert.equal(state.fetchLocks.has(namespace), false, 'no orphaned fetch lock may remain after all callers settle');
+  } finally {
+    c1Gate.resolve();
+    c3Gate.resolve();
+    await c1.destroy();
+  }
+});
