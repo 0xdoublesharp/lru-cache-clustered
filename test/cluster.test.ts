@@ -318,7 +318,7 @@ void test('cluster: worker timeouts honor failsafe modes over real IPC', { timeo
 
   const originalGet = inner.get.bind(inner);
   (inner as { get: (key: string) => unknown }).get = (key: string) => {
-    const end = Date.now() + 150;
+    const end = Date.now() + 250;
     while (Date.now() < end) {
       // Busy-wait on the primary so the worker's own timer can fire.
     }
@@ -330,13 +330,13 @@ void test('cluster: worker timeouts honor failsafe modes over real IPC', { timeo
 
   try {
     const resolved = await worker.send<{ status: string; value?: unknown }>('getOutcome', {
-      options: { namespace, max: 10, timeout: 40, failsafe: 'resolve' },
+      options: { namespace, max: 10, timeout: 100, failsafe: 'resolve' },
       key: 'missing',
     });
     assert.deepEqual(resolved, { status: 'resolved', value: undefined });
 
     const rejected = await worker.send<{ status: string; message?: string }>('getOutcome', {
-      options: { namespace, max: 10, timeout: 40, failsafe: 'reject' },
+      options: { namespace, max: 10, timeout: 100, failsafe: 'reject' },
       key: 'missing',
     });
     assert.equal(rejected.status, 'rejected');
@@ -361,7 +361,7 @@ void test(
 
     const originalGet = inner.get.bind(inner);
     (inner as { get: (key: string) => unknown }).get = (key: string) => {
-      const end = Date.now() + 100;
+      const end = Date.now() + 250;
       while (Date.now() < end) {
         // Busy-wait so the worker's IPC timer fires before the response.
       }
@@ -373,7 +373,7 @@ void test(
 
     try {
       const result = await worker.send<{ status: string; size?: number; isMap?: boolean }>('mGetOutcome', {
-        options: { namespace, max: 10, timeout: 20, failsafe: 'resolve' },
+        options: { namespace, max: 10, timeout: 100, failsafe: 'resolve' },
         keys: ['a', 'b'],
       });
       // Pre-2.0.x mGet relied on `new Map(undefined)` returning an empty Map
@@ -404,7 +404,7 @@ void test(
 
     const originalRttl = inner.getRemainingTTL.bind(inner);
     (inner as { getRemainingTTL: (key: string) => unknown }).getRemainingTTL = (key: string) => {
-      const end = Date.now() + 100;
+      const end = Date.now() + 250;
       while (Date.now() < end) {
         // Busy-wait so the worker's IPC timer fires before the response.
       }
@@ -421,7 +421,7 @@ void test(
         isInfinity?: boolean;
         asString?: string;
       }>('rttlOutcome', {
-        options: { namespace, max: 10, timeout: 20, failsafe: 'resolve' },
+        options: { namespace, max: 10, timeout: 100, failsafe: 'resolve' },
         key: 'k',
       });
       // The JSON-IPC `null → Infinity` normalization must use strict equality
