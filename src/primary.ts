@@ -49,7 +49,8 @@ type FetchLock = {
 // hangs without process exit (which would otherwise be released by the
 // cluster.on('exit') handler). 30s is generous for typical user fetchers
 // and short enough that hung-leader incidents do not park requests forever.
-const FETCH_LEASE_MS = 30_000;
+export const FETCH_LEASE_MS = 30_000;
+export const SUPERSEDED_ERROR = 'Fetch was superseded by a cache mutation and no current value remains';
 
 type PrimaryState = {
   caches: Map<string, AnyCache>;
@@ -92,61 +93,31 @@ function bumpNamespaceVersion(namespace: string): number {
   return next;
 }
 
-function freshStats(namespace: string): Stats {
-  return { namespace, hits: 0, misses: 0, sets: 0, deletes: 0, evictions: 0, size: 0 };
-}
-
 function getStats(namespace: string): Stats {
   let s = stats.get(namespace);
   if (!s) {
-    s = freshStats(namespace);
+    s = { namespace, hits: 0, misses: 0, sets: 0, deletes: 0, evictions: 0, size: 0 };
     stats.set(namespace, s);
   }
   return s;
 }
 
-function readOptions(cache: AnyCache): SerializableLruOptions {
-  const c = cache as unknown as {
-    max: number;
-    maxSize: number;
-    maxEntrySize: number;
-    ttl: number;
-    allowStale: boolean;
-    updateAgeOnGet: boolean;
-    updateAgeOnHas: boolean;
-    noDeleteOnStaleGet: boolean;
-    ttlAutopurge: boolean;
-  };
-  return {
-    max: c.max,
-    maxSize: c.maxSize,
-    maxEntrySize: c.maxEntrySize,
-    ttl: c.ttl,
-    allowStale: c.allowStale,
-    updateAgeOnGet: c.updateAgeOnGet,
-    updateAgeOnHas: c.updateAgeOnHas,
-    noDeleteOnStaleGet: c.noDeleteOnStaleGet,
-    ttlAutopurge: c.ttlAutopurge,
-  };
-}
-
 function getCacheForPayload(namespace: string, payload: ExecPayload): AnyCache {
-  const existing = caches.get(namespace);
-  if (existing) return existing;
-  return getOrCreateCache(namespace, payload.cacheOptions);
+  return caches.get(namespace) ?? getOrCreateCache(namespace, payload.cacheOptions);
 }
 
 function assertOptionsCompatible(namespace: string, cache: AnyCache, options?: SerializableLruOptions): void {
   if (!options) return;
 
-  const current = readOptions(cache);
+  const current = cache as unknown as Required<SerializableLruOptions>;
   const mismatches: string[] = [];
 
   for (const [key, value] of Object.entries(options) as Array<
     [keyof SerializableLruOptions, SerializableLruOptions[keyof SerializableLruOptions]]
   >) {
     if (value === undefined) continue;
-    if (current[key] !== value) {
+    const expected = key === 'maxEntrySize' && !value ? current.maxSize : value;
+    if (current[key] !== expected) {
       mismatches.push(`${key}=${String(current[key])} (existing) != ${String(value)} (incoming)`);
     }
   }
@@ -166,43 +137,46 @@ function requireNonNullish(label: string, value: unknown): NonNullish {
 const requireKey = (key: unknown): NonNullish => requireNonNullish('cache key', key);
 const requireValue = (value: unknown): NonNullish => requireNonNullish('cache value', value);
 
-function recordKeyWrite(namespace: string, key: NonNullish): void {
+function validateTtl(ttl: number | undefined): void {
+  if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 0)) throw new TypeError('invalid ttl');
+}
+
+function recordKeyWrite(namespace: string, key: NonNullish, stored: boolean): void {
   supersedeFetch(namespace, key);
-  getStats(namespace).sets += 1;
+  if (stored) getStats(namespace).sets += 1;
   bumpNamespaceVersion(namespace);
 }
 
-function readEntrySize(cache: AnyCache, key: NonNullish): number | undefined {
-  const info = (
-    cache as unknown as {
-      info: (key: NonNullish) => LRUCache.Entry<NonNullish> | undefined;
-    }
-  ).info(key);
-  return typeof info?.size === 'number' ? info.size : undefined;
-}
-
-function getFetchNamespaceLocks(namespace: string): Map<NonNullish, FetchLock> {
-  let locks = fetchLocks.get(namespace);
-  if (!locks) {
-    locks = new Map();
-    fetchLocks.set(namespace, locks);
+function writeEntry(
+  cache: AnyCache,
+  key: NonNullish,
+  value: NonNullish,
+  opts: { ttl?: number; size?: number },
+): boolean {
+  const { ttl, size } = opts;
+  validateTtl(ttl);
+  if (
+    cache.maxSize &&
+    Number.isInteger(size) &&
+    (size as number) > 0 &&
+    cache.peek(key, { allowStale: true }) === value &&
+    cache.info(key)?.size !== size
+  ) {
+    cache.delete(key);
   }
-  return locks;
+  cache.set(key, value, { ttl, size });
+  return cache.peek(key, { allowStale: true }) !== undefined;
 }
 
 function supersedeFetch(namespace: string, key: NonNullish): boolean {
-  const removed = fetchLocks.get(namespace)?.delete(key) ?? false;
-  cleanupFetchNamespaceLocks(namespace);
+  const locks = fetchLocks.get(namespace);
+  const removed = locks?.delete(key) ?? false;
+  if (locks?.size === 0) fetchLocks.delete(namespace);
   return removed;
 }
 
-function cleanupFetchNamespaceLocks(namespace: string): void {
-  if (fetchLocks.get(namespace)?.size === 0) fetchLocks.delete(namespace);
-}
-
 function pruneFetchLock(namespace: string, key: NonNullish, lock: FetchLock): void {
-  if (!lock.token && lock.followers.size === 0) fetchLocks.get(namespace)?.delete(key);
-  cleanupFetchNamespaceLocks(namespace);
+  if (!lock.token && lock.followers.size === 0) supersedeFetch(namespace, key);
 }
 
 function releaseFetchLocksForWorker(workerId: number): void {
@@ -218,31 +192,30 @@ function releaseFetchLocksForWorker(workerId: number): void {
 }
 
 function buildCache(options: SerializableLruOptions, s: Stats): AnyCache {
-  const cacheOptions = {
+  if (options.maxSize && options.maxEntrySize && options.maxEntrySize > options.maxSize) {
+    throw new TypeError('maxEntrySize must not exceed maxSize');
+  }
+  const opts: SerializableLruOptions & {
+    dispose: (_value: NonNullish, key: NonNullish, reason: LRUCache.DisposeReason) => void;
+  } = {
     ...options,
-    dispose: (_value: NonNullish, key: NonNullish, reason: LRUCache.DisposeReason) => {
+    dispose: (_value, key, reason) => {
       if (reason === 'evict') {
         s.evictions += 1;
         supersedeFetch(s.namespace, key);
         if (primaryState.activeEvictions?.namespace === s.namespace) primaryState.activeEvictions.keys.push(key);
       }
     },
-  } as SerializableLruOptions & {
-    dispose: (_value: NonNullish, _key: NonNullish, reason: LRUCache.DisposeReason) => void;
   };
-  const defaultedOptions =
-    cacheOptions.max === undefined && cacheOptions.maxSize === undefined && cacheOptions.ttl === undefined
-      ? { ...cacheOptions, max: 1000 }
-      : cacheOptions;
-  return new LRUCache(defaultedOptions as ConstructorParameters<typeof LRUCache>[0]);
+  if (opts.max === undefined && opts.maxSize === undefined && opts.ttl === undefined) opts.max = 1000;
+  return new LRUCache(opts as ConstructorParameters<typeof LRUCache>[0]);
 }
 
 export function getOrCreateCache(namespace: string, options?: SerializableLruOptions): AnyCache {
   let cache = caches.get(namespace);
   if (!cache) {
-    const s = freshStats(namespace);
-    stats.set(namespace, s);
-    cache = buildCache(options ?? {}, s);
+    stats.delete(namespace);
+    cache = buildCache(options ?? {}, getStats(namespace));
     caches.set(namespace, cache);
     debug(`Created LRUCache for namespace '${namespace}'`);
   } else {
@@ -266,12 +239,8 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       getOrCreateCache(namespace, payload.cacheOptions);
       return undefined;
     case 'destroy': {
-      const existingCache = caches.get(namespace);
-      const cacheExisted = caches.delete(namespace);
-      existingCache?.clear();
-      const statsExisted = stats.delete(namespace);
-      const locksExisted = fetchLocks.delete(namespace);
-      const existed = cacheExisted || statsExisted || locksExisted;
+      caches.get(namespace)?.clear();
+      const existed = [caches, stats, fetchLocks].filter((m) => m.delete(namespace)).length > 0;
       if (existed) bumpNamespaceVersion(namespace);
       return existed;
     }
@@ -280,27 +249,22 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const cache = payload.existingOnly ? caches.get(namespace) : getCacheForPayload(namespace, payload);
       if (!cache) return undefined;
       const value = cache.get(key);
-      const s = getStats(namespace);
-      if (value !== undefined) s.hits += 1;
-      else s.misses += 1;
+      getStats(namespace)[value !== undefined ? 'hits' : 'misses'] += 1;
       return value;
     }
     case 'set': {
       const key = requireKey(payload.key);
-      getCacheForPayload(namespace, payload).set(key, requireValue(payload.value), {
-        ttl: payload.ttl,
-        size: payload.size,
-      });
-      recordKeyWrite(namespace, key);
-      return true;
+      const stored = writeEntry(getCacheForPayload(namespace, payload), key, requireValue(payload.value), payload);
+      recordKeyWrite(namespace, key, stored);
+      return stored;
     }
     case 'setIfAbsent': {
       const cache = getCacheForPayload(namespace, payload);
       const key = requireKey(payload.key);
       if (cache.peek(key, { allowStale: false }) !== undefined) return false;
-      cache.set(key, requireValue(payload.value), { ttl: payload.ttl, size: payload.size });
-      recordKeyWrite(namespace, key);
-      return true;
+      const stored = writeEntry(cache, key, requireValue(payload.value), payload);
+      if (stored) recordKeyWrite(namespace, key, true);
+      return stored;
     }
     case 'delete': {
       const key = requireKey(payload.key);
@@ -324,29 +288,24 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const s = getStats(namespace);
       return payload.keys.map(requireKey).map((key) => {
         const value = cache.get(key);
-        if (value !== undefined) s.hits += 1;
-        else s.misses += 1;
+        s[value !== undefined ? 'hits' : 'misses'] += 1;
         return [key, value] as [unknown, unknown];
       });
     }
     case 'mSet': {
       const cache = getCacheForPayload(namespace, payload);
       const s = getStats(namespace);
-      const entries = payload.entries.map(([key, value, entryOpts]) => ({
-        key: requireKey(key),
-        value: requireValue(value),
-        entryOpts,
-      }));
+      const entries = payload.entries.map(([key, value, entryOpts]) => {
+        const ttl = entryOpts?.ttl ?? payload.ttl;
+        validateTtl(ttl);
+        return [requireKey(key), requireValue(value), ttl, entryOpts?.size ?? payload.size] as const;
+      });
       let changed = false;
       try {
-        for (const { key, value, entryOpts } of entries) {
-          cache.set(key, value, {
-            ttl: entryOpts?.ttl ?? payload.ttl,
-            size: entryOpts?.size ?? payload.size,
-          });
+        for (const [key, value, ttl, size] of entries) {
+          if (writeEntry(cache, key, value, { ttl, size })) s.sets += 1;
           supersedeFetch(namespace, key);
           changed = true;
-          s.sets += 1;
         }
       } finally {
         if (changed || entries.length === 0) bumpNamespaceVersion(namespace);
@@ -393,9 +352,8 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'size':
       return getCacheForPayload(namespace, payload).size;
     case 'stats': {
-      const cache = getCacheForPayload(namespace, payload);
       const s = getStats(namespace);
-      s.size = cache.size;
+      s.size = getCacheForPayload(namespace, payload).size;
       return { ...s };
     }
     case 'purgeStale': {
@@ -407,15 +365,16 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'decr': {
       const cache = getCacheForPayload(namespace, payload);
       const key = requireKey(payload.key);
-      const amount = payload.amount ?? 1;
-      if (!Number.isFinite(amount)) throw new TypeError('invalid amount');
+      const amount = payload.amount === undefined ? 1 : payload.amount;
       const current = cache.peek(key, { allowStale: false });
       const existed = current !== undefined;
       const base = typeof current === 'number' ? current : 0;
       const next = base + amount * (payload.op === 'decr' ? -1 : 1);
-      const size = payload.size ?? (existed ? readEntrySize(cache, key) : undefined);
+      if (!Number.isFinite(amount) || !Number.isFinite(next)) throw new TypeError('invalid amount');
+      if (!existed) validateTtl(payload.ttl);
+      const size = payload.size ?? (existed ? cache.info(key)?.size : undefined);
       cache.set(key, next, existed ? { size, noUpdateTTL: true } : { ttl: payload.ttl, size });
-      recordKeyWrite(namespace, key);
+      recordKeyWrite(namespace, key, cache.peek(key, { allowStale: true }) !== undefined);
       return next;
     }
     case 'fetchClaim': {
@@ -424,7 +383,7 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       if (payload.generation !== undefined && existing?.generation !== payload.generation) {
         const value = caches.get(namespace)?.get(key);
         if (value !== undefined) return { kind: 'value', value };
-        throw new Error('Fetch was superseded by a cache mutation and no current value remains');
+        throw new Error(SUPERSEDED_ERROR);
       }
       const cache = getCacheForPayload(namespace, payload);
       const now = Date.now();
@@ -445,7 +404,9 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       }
       const token = `fetch-${++primaryState.nextFetchToken}`;
       if (payload.requestId) existing?.followers.delete(payload.requestId);
-      getFetchNamespaceLocks(namespace).set(key, {
+      let nsLocks = fetchLocks.get(namespace);
+      if (!nsLocks) fetchLocks.set(namespace, (nsLocks = new Map<NonNullish, FetchLock>()));
+      nsLocks.set(key, {
         token,
         generation: existing?.generation ?? token,
         followers: existing?.followers ?? new Map<string, number | undefined>(),
@@ -457,14 +418,10 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     }
     case 'fetchStore': {
       const key = requireKey(payload.key);
-      const locks = fetchLocks.get(namespace);
-      const lock = locks?.get(key);
+      const lock = fetchLocks.get(namespace)?.get(key);
       if (!lock || lock.token !== payload.token) return false;
-      getCacheForPayload(namespace, payload).set(key, requireValue(payload.value), {
-        ttl: payload.ttl,
-        size: payload.size,
-      });
-      recordKeyWrite(namespace, key);
+      const stored = writeEntry(getCacheForPayload(namespace, payload), key, requireValue(payload.value), payload);
+      recordKeyWrite(namespace, key, stored);
       return true;
     }
     case 'fetchAbort': {
@@ -491,9 +448,16 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const cache = getCacheForPayload(namespace, payload);
       if (typeof payload.value === 'number' && payload.value !== cache.max) {
         const s = getStats(namespace);
-        const opts = { ...readOptions(cache), max: payload.value };
+        const opts: SerializableLruOptions = { max: payload.value };
+        for (const k of 'maxSize maxEntrySize ttl allowStale updateAgeOnGet updateAgeOnHas noDeleteOnStaleGet ttlAutopurge'.split(
+          ' ',
+        )) {
+          (opts as Record<string, unknown>)[k] = (cache as unknown as Record<string, unknown>)[k];
+        }
         const replacement = buildCache(opts, s);
-        replacement.load(cache.dump());
+        const dumped = cache.dump();
+        if (opts.ttl) for (const [, e] of dumped) if (e.ttl === undefined) e.ttl = 0;
+        replacement.load(dumped);
         caches.set(namespace, replacement);
         cache.clear();
         bumpNamespaceVersion(namespace);
@@ -503,22 +467,20 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     }
     case 'ttl': {
       const cache = getCacheForPayload(namespace, payload);
-      const current = (cache as unknown as { ttl: number }).ttl;
       if (typeof payload.value === 'number') {
-        if (!Number.isInteger(payload.value) || payload.value < 0 || (!payload.value && !cache.max && !cache.maxSize)) {
-          throw new TypeError('invalid ttl');
-        }
-        if (payload.value !== current) {
-          (cache as unknown as { ttl: number }).ttl = payload.value;
+        validateTtl(payload.value);
+        if (!payload.value && !cache.max && !cache.maxSize) throw new TypeError('invalid ttl');
+        if (payload.value !== cache.ttl) {
+          cache.ttl = payload.value;
           bumpNamespaceVersion(namespace);
         }
       }
-      return (cache as unknown as { ttl: number }).ttl;
+      return cache.ttl;
     }
     case 'allowStale': {
       const cache = getCacheForPayload(namespace, payload);
-      if (typeof payload.value === 'boolean') (cache as unknown as { allowStale: boolean }).allowStale = payload.value;
-      return (cache as unknown as { allowStale: boolean }).allowStale;
+      if (typeof payload.value === 'boolean') cache.allowStale = payload.value;
+      return cache.allowStale;
     }
     default: {
       const op = (payload as { op: string }).op;
@@ -529,18 +491,15 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
 
 // Bulk ops broadcast a namespace-wide invalidate; single-key ops broadcast the
 // specific key. Reasoning in spec section 5.3.
-export const BULK_BROADCAST_OPS: ReadonlySet<string> = new Set([
-  'destroy',
-  'clear',
-  'purgeStale',
-  'mSet',
-  'mDelete',
-  'load',
-  'max',
-  'ttl',
-]);
+const BULK_BROADCAST_OPS: ReadonlySet<string> = new Set(
+  'destroy clear purgeStale mSet mDelete load max ttl'.split(' '),
+);
 
-function buildInvalidation(namespace: string, payload: ExecPayload, version: number): InvalidationPush | undefined {
+export function buildInvalidation(
+  namespace: string,
+  payload: ExecPayload,
+  version: number,
+): InvalidationPush | undefined {
   if (BULK_BROADCAST_OPS.has(payload.op)) {
     return { source: SOURCE, push: 'l1:invalidate-namespace', namespace, version };
   }
@@ -554,35 +513,23 @@ function buildInvalidation(namespace: string, payload: ExecPayload, version: num
 
 function sendToWorker(worker: Worker, msg: Response | InvalidationPush): void {
   if (!worker.isConnected()) return;
+  const logFailure = (error: unknown) => debug(`worker ${worker.id} send failed: %s`, error);
   try {
     worker.send(msg, (error: Error | null) => {
-      if (error) debug(`worker ${worker.id} send failed: %s`, error);
+      if (error) logFailure(error);
     });
   } catch (err) {
-    debug(`worker ${worker.id} send failed: %s`, err);
+    logFailure(err);
   }
 }
 
-function broadcastInvalidation(msg: InvalidationPush): void {
-  for (const worker of Object.values(cluster.workers ?? {})) {
-    if (worker) sendToWorker(worker, msg);
-  }
-}
-
-const EVICTING_OPS: ReadonlySet<string> = new Set([
-  'set',
-  'setIfAbsent',
-  'mSet',
-  'load',
-  'incr',
-  'decr',
-  'fetchStore',
-  'max',
-]);
+const EVICTING_OPS: ReadonlySet<string> = new Set('set setIfAbsent mSet load incr decr fetchStore max'.split(' '));
 
 function publishInvalidation(msg: InvalidationPush): void {
   emitInvalidation(msg);
-  broadcastInvalidation(msg);
+  for (const worker of Object.values(cluster.workers ?? {})) {
+    if (worker) sendToWorker(worker, msg);
+  }
 }
 
 export function dispatchAndBroadcast(
@@ -629,7 +576,7 @@ export function dispatchAndBroadcast(
 }
 
 export function handleRequest(request: Request, context: DispatchContext = {}): Response {
-  if (typeof request !== 'object' || request === null) {
+  if (!request || typeof request !== 'object') {
     return err(request, 'invalid request: not an object');
   }
   // Validate the full Request shape before dispatching. Without this guard,
@@ -661,15 +608,10 @@ export function installClusterListener(): void {
   if (primaryState.clusterListenerInstalled) return;
   primaryState.clusterListenerInstalled = true;
 
-  cluster.on('disconnect', (worker: Worker) => {
-    releaseFetchLocksForWorker(worker.id);
-  });
-  cluster.on('exit', (worker: Worker) => {
-    releaseFetchLocksForWorker(worker.id);
-  });
-  cluster.on('fork', (worker: Worker) => {
-    attachWorkerHandler(worker);
-  });
+  const release = (worker: Worker) => releaseFetchLocksForWorker(worker.id);
+  cluster.on('disconnect', release);
+  cluster.on('exit', release);
+  cluster.on('fork', attachWorkerHandler);
   // Cover workers that already exist when the listener is installed late
   // (e.g. bootstrap() called after some forks). cluster.on('fork') only
   // fires for future workers, so without this those would never get a

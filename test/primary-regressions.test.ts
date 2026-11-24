@@ -421,14 +421,114 @@ void test('incr and decr reject non-finite amount values instead of storing NaN/
     request(namespace, 'init', { options: { max: 10 } });
     request(namespace, 'set', { key: 'c', value: 5 });
     for (const op of ['incr', 'decr'] as const) {
-      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '2' as unknown as number]) {
+      for (const bad of [
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        null as unknown as number,
+        '2' as unknown as number,
+      ]) {
         const resp = request(namespace, op, { key: 'c', amount: bad });
         assert.equal(resp.ok, false, `expected ${op} with amount=${String(bad)} to fail`);
         if (!resp.ok) assert.match(resp.error.message, /invalid amount/i);
       }
     }
     assert.equal((request(namespace, 'get', { key: 'c' }) as { value: unknown }).value, 5);
+
+    // Overflow past finite double range must reject instead of storing Infinity.
+    request(namespace, 'set', { key: 'big', value: Number.MAX_VALUE });
+    const overflow = request(namespace, 'incr', { key: 'big', amount: Number.MAX_VALUE });
+    assert.equal(overflow.ok, false);
+    assert.equal((request(namespace, 'get', { key: 'big' }) as { value: unknown }).value, Number.MAX_VALUE);
   } finally {
     request(namespace, 'destroy');
+  }
+});
+
+void test('oversized writes do not report admission or inflate sets, and invalid per-write ttl rejects', () => {
+  const namespace = 'primary-oversize-and-neg-ttl';
+  try {
+    request(namespace, 'init', { options: { maxSize: 10, maxEntrySize: 5 } });
+
+    // Oversized setIfAbsent must not claim key or count as a set.
+    const sia = request(namespace, 'setIfAbsent', { key: 'claim', value: 'v1', size: 6 });
+    assert.ok(sia.ok);
+    assert.equal(sia.value, false);
+    assert.equal((request(namespace, 'stats') as { value: { sets: number } }).value.sets, 0);
+
+    // Normal set followed by oversized set removes old value, returns false, and does not increment sets.
+    assert.equal((request(namespace, 'set', { key: 'k', value: 'v1', size: 2 }) as { value: boolean }).value, true);
+    assert.equal((request(namespace, 'stats') as { value: { sets: number } }).value.sets, 1);
+    const overSet = request(namespace, 'set', { key: 'k', value: 'v2', size: 6 });
+    assert.ok(overSet.ok);
+    assert.equal(overSet.value, false);
+    assert.equal((request(namespace, 'has', { key: 'k' }) as { value: boolean }).value, false);
+    assert.equal((request(namespace, 'stats') as { value: { sets: number } }).value.sets, 1);
+
+    // Oversized mSet does not inflate sets.
+    assert.equal(request(namespace, 'mSet', { entries: [['m', 'v', { size: 6 }]] }).ok, true);
+    assert.equal((request(namespace, 'stats') as { value: { sets: number } }).value.sets, 1);
+
+    // Oversized fetchStore still acknowledges token (returns true) without inflating sets.
+    const claim = request(namespace, 'fetchClaim', { key: 'f', requestId: 'r1' });
+    assert.ok(claim.ok);
+    const tok = (claim.value as { token: string }).token;
+    const fstore = request(namespace, 'fetchStore', { key: 'f', token: tok, value: 'v', size: 6 });
+    assert.ok(fstore.ok);
+    assert.equal(fstore.value, true);
+    assert.equal((request(namespace, 'stats') as { value: { sets: number } }).value.sets, 1);
+
+    // Negative / non-integer per-write TTL rejects across all write paths.
+    for (const badTtl of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.equal(request(namespace, 'set', { key: 't', value: 'v', size: 1, ttl: badTtl }).ok, false);
+      assert.equal(request(namespace, 'setIfAbsent', { key: 't', value: 'v', size: 1, ttl: badTtl }).ok, false);
+      assert.equal(request(namespace, 'mSet', { entries: [['t', 'v', { size: 1, ttl: badTtl }]] }).ok, false);
+      assert.equal(request(namespace, 'incr', { key: 't', amount: 1, size: 1, ttl: badTtl }).ok, false);
+    }
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('maxEntrySize > maxSize is rejected and identical maxEntrySize=0 options stay compatible', () => {
+  const badNs = 'primary-bad-max-entry-size';
+  const compatNs = 'primary-compat-zero-max-entry-size';
+  try {
+    const bad = request(badNs, 'init', { options: { max: 2, maxSize: 4, maxEntrySize: 8 } });
+    assert.equal(bad.ok, false);
+    if (!bad.ok) assert.match(bad.error.message, /maxEntrySize/i);
+
+    assert.equal(request(compatNs, 'init', { options: { maxSize: 10, maxEntrySize: 0 } }).ok, true);
+    assert.equal(request(compatNs, 'init', { options: { maxSize: 10, maxEntrySize: 0 } }).ok, true);
+  } finally {
+    request(badNs, 'destroy');
+    request(compatNs, 'destroy');
+  }
+});
+
+void test('same-value write updates entry size and max() preserves non-expiring keys after ttl()', () => {
+  const sizeNs = 'primary-same-value-size-update';
+  const maxTtlNs = 'primary-max-after-ttl-infinity';
+  try {
+    request(sizeNs, 'init', { options: { maxSize: 10 } });
+    request(sizeNs, 'set', { key: 'a', value: 'same', size: 1 });
+    request(sizeNs, 'set', { key: 'a', value: 'same', size: 9 });
+    request(sizeNs, 'set', { key: 'b', value: 'other', size: 2 });
+    assert.equal((request(sizeNs, 'has', { key: 'a' }) as { value: boolean }).value, false);
+    assert.equal((request(sizeNs, 'has', { key: 'b' }) as { value: boolean }).value, true);
+
+    request(maxTtlNs, 'init', { options: { max: 2 } });
+    request(maxTtlNs, 'set', { key: 'forever', value: 'v' });
+    assert.equal((request(maxTtlNs, 'getRemainingTTL', { key: 'forever' }) as { value: number }).value, Infinity);
+    request(maxTtlNs, 'ttl', { value: 1000 });
+    request(maxTtlNs, 'max', { value: 3 });
+    assert.equal(
+      (request(maxTtlNs, 'getRemainingTTL', { key: 'forever' }) as { value: number }).value,
+      Infinity,
+      'max() rebuild must not assign default ttl to previously non-expiring entries',
+    );
+  } finally {
+    request(sizeNs, 'destroy');
+    request(maxTtlNs, 'destroy');
   }
 });
