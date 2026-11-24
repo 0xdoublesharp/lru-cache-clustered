@@ -409,6 +409,24 @@ void test('malformed nested error causes cannot crash or consume the pending res
   assert.equal(await p, 'still pending');
 });
 
+void test('sendToPrimary ignores late send callback errors after a response settles', async () => {
+  const fake = makeFakeProcess();
+  let sendCb: ((err: Error | null) => void) | undefined;
+  const client = createIpcClient({
+    send(msg, cb) {
+      fake.send(msg);
+      sendCb = cb;
+      return true;
+    },
+    on: fake.on.bind(fake),
+  });
+  const p = client.sendToPrimary({ namespace: 'n', timeout: 1000, failsafe: 'reject' }, { op: 'get', key: 'k' });
+  const sent = fake.sent[0] as { id: string };
+  fake.deliver({ id: sent.id, source: SOURCE, ok: true, value: 'ok' });
+  assert.equal(await p, 'ok');
+  assert.doesNotThrow(() => sendCb?.(new Error('late send failure')));
+});
+
 void test('isInvalidationPush ignores pushes with NaN or non-finite version', () => {
   let listener: ((msg: unknown) => void) | undefined;
   const client = createIpcClient({

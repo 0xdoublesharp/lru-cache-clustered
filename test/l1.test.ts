@@ -410,3 +410,30 @@ void test('normalizeL1 honors explicit localL1.ttl below 100ms and clamps derive
     await derivedShortPrimary.destroy();
   }
 });
+
+void test('l1:evict listener triggering an invalidation of the incoming key never leaves stale data in L1', async () => {
+  const namespace = 'l1-evict-reentrant-invalidation';
+  const reader = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, max: 1, ttl: 5000 },
+  });
+  const writer = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  try {
+    await writer.set('a', 'va');
+    await writer.set('b', 'old');
+    assert.equal(await reader.get('a'), 'va');
+
+    let writePromise: Promise<boolean> | undefined;
+    reader.once('l1:evict', () => {
+      writePromise = writer.set('b', 'new');
+    });
+
+    assert.equal(await reader.get('b'), 'old');
+    await writePromise;
+    assert.equal(await reader.get('b'), 'new', 'L1 must not retain stale incoming value invalidated during eviction');
+  } finally {
+    await reader.destroy();
+    await writer.destroy();
+  }
+});

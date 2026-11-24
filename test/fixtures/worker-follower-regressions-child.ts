@@ -7,7 +7,7 @@ if (!cluster.isWorker) throw new Error('worker fixture requires a cluster worker
 try {
   const results: unknown[] = [];
   for (const mutation of ['delete', 'clear', 'load', 'destroy', 'set'] as const) {
-    const options = { namespace: `worker-follower-${mutation}`, max: 10 };
+    const options = { namespace: `worker-follower-${mutation}`, max: 10, timeout: 2_000 };
     const leader = new LRUCacheClustered<string, string>(options);
     const follower = new LRUCacheClustered<string, string>(options);
     let release!: () => void;
@@ -49,6 +49,7 @@ try {
   const cache = new LRUCacheClustered<string, string>({
     namespace: 'worker-ttl-own-capacity',
     max: 2,
+    timeout: 2_000,
     localL1: { experimental: true, invalidation: 'ttl-only', ttl: 5000 },
   });
   await cache.set('victim', 'old');
@@ -64,8 +65,16 @@ try {
   // Simulate the first follower acknowledgement being lost after the primary
   // has registered it. The public fetch must release by its known request ID.
   const timeoutNamespace = 'worker-follower-lost-ack';
-  const timeoutLeader = new LRUCacheClustered<string, string>({ namespace: timeoutNamespace, max: 10 });
-  const timeoutFollower = new LRUCacheClustered<string, string>({ namespace: timeoutNamespace, max: 10 });
+  const timeoutLeader = new LRUCacheClustered<string, string>({
+    namespace: timeoutNamespace,
+    max: 10,
+    timeout: 2_000,
+  });
+  const timeoutFollower = new LRUCacheClustered<string, string>({
+    namespace: timeoutNamespace,
+    max: 10,
+    timeout: 2_000,
+  });
   let releaseFailure!: () => void;
   let leaderStarted!: () => void;
   const failureGate = new Promise<void>((resolve) => {

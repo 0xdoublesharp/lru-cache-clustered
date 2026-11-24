@@ -166,9 +166,42 @@ async function exerciseWorkerInitL1SubscriptionCleanup() {
   }
 }
 
+async function exerciseWorkerL1SnapshotAndCounterJsonIpc() {
+  const namespace = 'coverage-worker-l1-snapshot-and-counter';
+  const cache = await LRUCacheClustered.getInstance<string, { nested: number } | number>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  try {
+    // Mutating the caller's object while set({ updateL1: true }) is in flight must not diverge L1 from primary.
+    const obj = { nested: 1 };
+    const pSet = cache.set('obj', obj, { updateL1: true });
+    obj.nested = 2;
+    await pSet;
+    assert.deepEqual(await cache.get('obj'), { nested: 1 });
+    assert.deepEqual(await cache.withoutLocal().get('obj'), { nested: 1 });
+
+    // Same isolation for fetch() leader populating L1.
+    const fetchedObj = { nested: 10 };
+    await cache.fetch('fetched', () => fetchedObj);
+    fetchedObj.nested = 99;
+    assert.deepEqual(await cache.get('fetched'), { nested: 10 });
+    assert.deepEqual(await cache.withoutLocal().get('fetched'), { nested: 10 });
+
+    // JSON IPC serializes Infinity/NaN to null; primary must still reject instead of incrementing by 1.
+    await assert.rejects(cache.incr('counter', Number.POSITIVE_INFINITY), /invalid amount/i);
+    await assert.rejects(cache.incr('counter', Number.NaN), /invalid amount/i);
+    assert.equal(await cache.get('counter'), undefined);
+  } finally {
+    await cache.destroy();
+  }
+}
+
 try {
   await exerciseSiblingInvalidations();
   await exerciseWorkerInitL1SubscriptionCleanup();
+  await exerciseWorkerL1SnapshotAndCounterJsonIpc();
   const cleanup = await exerciseFailedFollowerCleanup();
   process.send?.({ kind: 'result', cleanup }, () => process.disconnect?.());
 } catch (error) {

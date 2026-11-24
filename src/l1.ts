@@ -61,22 +61,11 @@ function objectKeyId(key: object): number {
 //
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export function encodeL1Key(key: {}): string {
-  switch (typeof key) {
-    case 'string':
-      return `s:${key}`;
-    case 'number':
-      return `n:${key}`;
-    case 'boolean':
-      return `b:${key}`;
-    case 'bigint':
-      return `i:${key.toString()}`;
-    case 'symbol':
-      throw new Error('L1 does not support symbol keys');
-    case 'function':
-      return `f:${objectKeyId(key)}`;
-    default:
-      return `o:${objectKeyId(key)}`;
-  }
+  const t = typeof key;
+  if (t === 'symbol') throw new Error('L1 does not support symbol keys');
+  return t === 'object' || t === 'function'
+    ? `${t[0]}:${objectKeyId(key)}`
+    : `${t === 'bigint' ? 'i' : t[0]}:${key as string | number | boolean | bigint}`;
 }
 
 // Per-instance L1 cache. One LocalL1Cache per LRUCacheClustered.
@@ -105,7 +94,7 @@ export class LocalL1Cache<V extends {} = {}> {
   constructor(opts: L1ConstructorOptions) {
     this.#emit = opts.emit ?? (() => undefined);
     this.#ttl = opts.ttl;
-    const lruOpts = {
+    this.#cache = new LRUCache({
       max: opts.max ?? 1000,
       ttl: opts.ttl,
       updateAgeOnGet: opts.updateAgeOnGet ?? true,
@@ -114,45 +103,41 @@ export class LocalL1Cache<V extends {} = {}> {
       // sizeCalculation is required when maxSize is set, but for v1 we don't
       // expose it in the public LocalL1Options. If a caller passes maxSize,
       // we use a 1-per-entry calculation as a placeholder.
-      ...(opts.maxSize !== undefined ? { sizeCalculation: () => 1 } : {}),
-      dispose: (value: L1Envelope<V>, key: string, reason: LRUCache.DisposeReason) => {
+      sizeCalculation: opts.maxSize !== undefined ? () => 1 : undefined,
+      disposeAfter: (value: L1Envelope<V>, key: string, reason: LRUCache.DisposeReason) => {
         if (reason === 'evict') {
           this.#stats.evictions += 1;
           this.#emit('evict', { key: value.key ?? key, reason: 'lru' });
         }
       },
-    } as ConstructorParameters<typeof LRUCache<string, L1Envelope<V>>>[0];
-    this.#cache = new LRUCache(lruOpts);
+    });
   }
 
   get(encodedKey: string, eventKey: unknown = encodedKey, mode: 'get' | 'peek' | 'has' = 'get'): V | undefined {
     const status: { returnedStale?: true } = {};
-    const entry =
+    let entry =
       mode === 'get'
         ? this.#cache.get(encodedKey, { status })
-        : this.#cache.peek(encodedKey, { allowStale: mode === 'has' ? false : this.#cache.allowStale });
+        : this.#cache.peek(encodedKey, { allowStale: mode !== 'has' && this.#cache.allowStale });
     if (mode === 'peek' && entry && this.#cache.getRemainingTTL(encodedKey) < 0) status.returnedStale = true;
+    const expired =
+      entry !== undefined &&
+      (entry.version < this.#latestSeen ||
+        (entry.expiresAt !== undefined && globalThis.performance.now() >= entry.expiresAt));
+    if (entry && (expired || status.returnedStale)) {
+      // Neither a local sliding TTL nor allowStale may extend the primary's
+      // expiration deadline or revive a value invalidated by a write.
+      this.#stats.staleHits += 1;
+      this.#emit('stale-hit', { key: entry.key });
+      if (expired) {
+        this.#cache.delete(encodedKey);
+        entry = undefined;
+      }
+    }
     if (!entry) {
       this.#stats.misses += 1;
       this.#emit('miss', { key: eventKey });
       return undefined;
-    }
-    if (
-      entry.version < this.#latestSeen ||
-      (entry.expiresAt !== undefined && globalThis.performance.now() >= entry.expiresAt)
-    ) {
-      // Neither a local sliding TTL nor allowStale may extend the primary's
-      // expiration deadline or revive a value invalidated by a write.
-      this.#cache.delete(encodedKey);
-      this.#stats.misses += 1;
-      this.#stats.staleHits += 1;
-      this.#emit('stale-hit', { key: entry.key });
-      this.#emit('miss', { key: eventKey });
-      return undefined;
-    }
-    if (status.returnedStale) {
-      this.#stats.staleHits += 1;
-      this.#emit('stale-hit', { key: entry.key });
     }
     this.#stats.hits += 1;
     this.#stats.ipcAvoided += 1;
@@ -187,10 +172,7 @@ export class LocalL1Cache<V extends {} = {}> {
 
   trackRead(encodedKey: string): L1Read {
     let pending = this.#pending.get(encodedKey);
-    if (!pending) {
-      pending = new Set();
-      this.#pending.set(encodedKey, pending);
-    }
+    if (!pending) this.#pending.set(encodedKey, (pending = new Set()));
     const read: L1Read = {
       version: this.#latestSeen,
       cancelled: false,

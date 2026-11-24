@@ -106,11 +106,7 @@ export type Stats = {
 // cluster.
 const SERIALIZE_CAUSE_MAX_DEPTH = 8;
 
-export function serializeError(err: unknown): SerializedError {
-  return serializeErrorAt(err, 0, new Set());
-}
-
-function serializeErrorAt(err: unknown, depth: number, seen: Set<object>): SerializedError {
+export function serializeError(err: unknown, depth = 0, seen = new Set<object>()): SerializedError {
   if (err instanceof Error) {
     if (seen.has(err)) {
       return { name: err.name, message: '[circular cause]' };
@@ -122,11 +118,10 @@ function serializeErrorAt(err: unknown, depth: number, seen: Set<object>): Seria
     if (typeof code === 'string' || typeof code === 'number') out.code = code;
     const cause = (err as { cause?: unknown }).cause;
     if (cause !== undefined) {
-      if (depth + 1 >= SERIALIZE_CAUSE_MAX_DEPTH) {
-        out.cause = { name: 'Error', message: '[cause chain truncated]' };
-      } else {
-        out.cause = serializeErrorAt(cause, depth + 1, seen);
-      }
+      out.cause =
+        depth + 1 >= SERIALIZE_CAUSE_MAX_DEPTH
+          ? { name: 'Error', message: '[cause chain truncated]' }
+          : serializeError(cause, depth + 1, seen);
     }
     return out;
   }

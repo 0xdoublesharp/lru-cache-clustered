@@ -1,5 +1,6 @@
 import { setTimeout, clearTimeout } from 'node:timers';
 import Debug from 'debug';
+import { emitMap, subscribeMap } from './invalidation.js';
 import {
   DEBUG_PREFIX,
   SOURCE,
@@ -57,18 +58,7 @@ export function createIpcClient(proc: ProcessLike): IpcClient {
       cb(raw);
       return;
     }
-    if (isInvalidationPush(raw)) {
-      const set = subscribers.get(raw.namespace);
-      if (!set) return;
-      for (const handler of set) {
-        try {
-          handler(raw);
-        } catch (err) {
-          messagesDebug('invalidation handler threw: %o', err);
-        }
-      }
-      return;
-    }
+    if (isInvalidationPush(raw)) emitMap(subscribers, raw, messagesDebug);
   });
 
   function send<T>(opts: SendOptions, payload: RequestPayload): Promise<DispatchResult<T>> {
@@ -95,43 +85,30 @@ export function createIpcClient(proc: ProcessLike): IpcClient {
       });
 
       messagesDebug('worker -> primary', request);
+      const fail = (error: unknown) => {
+        if (!callbacks.delete(id)) return;
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
       try {
         // A false return means the channel is congested, not that the message
         // was dropped. Keep waiting for its response; only the send callback
         // can report delivery failure. Retrying here could duplicate mutations.
         proc.send(request, (error) => {
-          if (!error || !callbacks.delete(id)) return;
-          clearTimeout(timer);
-          reject(error);
+          if (error) fail(error);
         });
       } catch (error) {
-        clearTimeout(timer);
-        callbacks.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
+        fail(error);
       }
     });
   }
 
   return {
-    async sendToPrimary<T>(opts: SendOptions, payload: RequestPayload): Promise<T> {
-      const r = await send<T>(opts, payload);
-      return r.value;
-    },
-    sendToPrimaryWithMeta: <T>(opts: SendOptions, payload: RequestPayload) => send<T>(opts, payload),
-    subscribeInvalidations(namespace: string, handler: InvalidationHandler): () => void {
-      let set = subscribers.get(namespace);
-      if (!set) {
-        set = new Set();
-        subscribers.set(namespace, set);
-      }
-      set.add(handler);
-      return () => {
-        const s = subscribers.get(namespace);
-        if (!s) return;
-        s.delete(handler);
-        if (s.size === 0) subscribers.delete(namespace);
-      };
-    },
+    sendToPrimary: <T>(opts: SendOptions, payload: RequestPayload): Promise<T> =>
+      send<T>(opts, payload).then((r) => r.value),
+    sendToPrimaryWithMeta: send,
+    subscribeInvalidations: (namespace: string, handler: InvalidationHandler): (() => void) =>
+      subscribeMap(subscribers, namespace, handler),
   };
 }
 
@@ -149,8 +126,8 @@ function isOurResponse(value: unknown): value is Response {
     for (let depth = 0; ; depth++) {
       if (
         depth > 8 ||
+        !error ||
         typeof error !== 'object' ||
-        error === null ||
         typeof (error as { name?: unknown }).name !== 'string' ||
         typeof (error as { message?: unknown }).message !== 'string'
       ) {
@@ -176,10 +153,9 @@ export function getDefaultClient(): IpcClient {
         'lru-cache-clustered: worker IPC client requested in a process without `process.send` (not a cluster worker).',
       );
     }
-    const send = process.send.bind(process);
     cachedDefaultClient = createIpcClient({
-      send: (msg, callback) => send(msg, callback),
-      on: (event, cb) => process.on(event, cb),
+      send: process.send.bind(process),
+      on: process.on.bind(process),
     });
   }
   return cachedDefaultClient;

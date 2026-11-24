@@ -56,7 +56,7 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
 ): WrappedCache<K, V> {
   const enc = (v: V): U | Promise<U> => codec.encode(v);
   const dec = (u: U): V | Promise<V> => codec.decode(u);
-  const decOpt = async (u: U | undefined): Promise<V | undefined> => (u === undefined ? undefined : await dec(u));
+  const decOpt = async (u: U | undefined): Promise<V | undefined> => (u === undefined ? undefined : dec(u));
 
   // Cast once to a `never`-valued surface for the public `cache` field. Users
   // who want to bypass the codec can drop in via `wrapped.cache as any` — we
@@ -64,7 +64,27 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
   // escape hatch.
   const underlying = cache as unknown as LRUCacheClustered<K, never>;
 
+  const passthroughs = Object.fromEntries(
+    'has delete getRemainingTTL mDelete keys size clear destroy healthCheck purgeStale stats'
+      .split(' ')
+      .map((m) => [m, (cache[m as keyof LRUCacheClustered<K, U>] as (...args: unknown[]) => unknown).bind(cache)]),
+  ) as Pick<
+    WrappedCache<K, V>,
+    | 'has'
+    | 'delete'
+    | 'getRemainingTTL'
+    | 'mDelete'
+    | 'keys'
+    | 'size'
+    | 'clear'
+    | 'destroy'
+    | 'healthCheck'
+    | 'purgeStale'
+    | 'stats'
+  >;
+
   const wrapped: WrappedCache<K, V> = {
+    ...passthroughs,
     cache: underlying,
     namespace: cache.namespace,
     ready: cache.ready,
@@ -78,12 +98,9 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
     async setIfAbsent(key, value, opts) {
       return cache.setIfAbsent(key, await enc(value), opts);
     },
-    has: (key, opts) => cache.has(key, opts),
     async peek(key, opts) {
       return decOpt(await cache.peek(key, opts));
     },
-    delete: (key) => cache.delete(key),
-    getRemainingTTL: (key) => cache.getRemainingTTL(key),
 
     async mGet(keys, opts) {
       const out = new Map<K, V | undefined>();
@@ -98,38 +115,22 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
       }
       return cache.mSet(encoded, opts);
     },
-    mDelete: (keys) => cache.mDelete(keys),
 
-    keys: () => cache.keys(),
     async values() {
-      const raw = await cache.values();
-      const out: V[] = [];
-      for (const v of raw ?? []) out.push(await dec(v));
-      return out;
+      return Promise.all(((await cache.values()) ?? []).map(async (v) => dec(v)));
     },
     async entries() {
-      const raw = await cache.entries();
-      const out: Array<[K, V]> = [];
-      for (const [k, v] of raw ?? []) out.push([k, await dec(v)]);
-      return out;
+      return Promise.all(((await cache.entries()) ?? []).map(async ([k, v]): Promise<[K, V]> => [k, await dec(v)]));
     },
-    size: () => cache.size(),
     async *[Symbol.asyncIterator]() {
       for (const pair of await this.entries()) yield pair;
     },
-
-    clear: () => cache.clear(),
-    destroy: () => cache.destroy(),
-    healthCheck: () => cache.healthCheck(),
-    purgeStale: () => cache.purgeStale(),
-    stats: () => cache.stats(),
 
     async fetch(key, fetcher, opts) {
       // Reuse the underlying cache.fetch single-flight path. Pass an inner
       // fetcher that encodes the produced value — the cache stores and returns
       // the encoded form, then we decode on the way out.
-      const raw = await cache.fetch(key, async (k) => await enc(await fetcher(k)), opts);
-      return await dec(raw);
+      return dec(await cache.fetch(key, async (k) => enc(await fetcher(k)), opts));
     },
   };
 

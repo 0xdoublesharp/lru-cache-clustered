@@ -1707,3 +1707,107 @@ void test('fetch in ttl-only L1 mode invalidates stale local entries on forceRef
     await c2.destroy();
   }
 });
+
+void test('destroy during an in-flight fetch does not re-subscribe the destroyed instance to L1 invalidations', async () => {
+  const namespace = 'destroy-during-inflight-fetch-l1';
+  const cache = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  const other = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  let release!: () => void;
+  let started!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const enter = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  try {
+    const pending = cache
+      .fetch('k', async () => {
+        started();
+        await gate;
+        return 'stale';
+      })
+      .catch((e: unknown) => e);
+    await enter;
+    await cache.destroy();
+
+    let invalidationsAfterDestroy = 0;
+    cache.on('l1:invalidate', () => {
+      invalidationsAfterDestroy += 1;
+    });
+
+    release();
+    const err = await pending;
+    assert.ok(err instanceof Error);
+    assert.match(err.message, /superseded/i);
+
+    await other.set('k', 'fresh');
+    assert.equal(invalidationsAfterDestroy, 0, 'in-flight fetch cleanup must not re-subscribe a destroyed instance');
+  } finally {
+    release();
+    await other.destroy();
+  }
+});
+
+void test(
+  'superseded or lease-expired in-flight fetch does not block later fetch calls on the same instance',
+  { timeout: 2000 },
+  async (t) => {
+    const namespace = 'superseded-inflight-unblocks-same-instance';
+    const cache = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+    let releaseFirst!: () => void;
+    let startedFirst!: () => void;
+    const gateFirst = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const enterFirst = new Promise<void>((resolve) => {
+      startedFirst = resolve;
+    });
+    try {
+      const first = cache.fetch('k', async () => {
+        startedFirst();
+        await gateFirst;
+        return 'old';
+      });
+      await enterFirst;
+      await cache.set('k', 'fresh');
+
+      // Must not hang waiting on `first` now that 'k' was explicitly written.
+      const second = await cache.withoutLocal().fetch('k', () => 'should-not-run');
+      assert.equal(second, 'fresh');
+
+      releaseFirst();
+      assert.equal(await first, 'fresh');
+
+      // Also verify lease-expired local in-flight slot does not block takeover.
+      let now = 1_000_000;
+      t.mock.method(Date, 'now', () => now);
+      let releaseHung!: () => void;
+      let startedHung!: () => void;
+      const gateHung = new Promise<void>((resolve) => {
+        releaseHung = resolve;
+      });
+      const enterHung = new Promise<void>((resolve) => {
+        startedHung = resolve;
+      });
+      const hung = cache.fetch('hung', async () => {
+        startedHung();
+        await gateHung;
+        return 'hung-result';
+      });
+      await enterHung;
+      now += 31_000; // Past 30s FETCH_LEASE_MS.
+      const takeover = await cache.fetch('hung', () => 'takeover-result');
+      assert.equal(takeover, 'takeover-result');
+      releaseHung();
+      assert.equal(await hung, 'takeover-result');
+    } finally {
+      releaseFirst();
+      await cache.destroy();
+    }
+  },
+);

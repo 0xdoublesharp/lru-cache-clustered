@@ -9,22 +9,27 @@ const subscribers = ((globalThis as Record<PropertyKey, unknown>)[key] ??= new M
 >;
 const debug = Debug(`${DEBUG_PREFIX}-invalidations`);
 
-export function subscribeInvalidations(namespace: string, handler: Handler): () => void {
-  let handlers = subscribers.get(namespace);
-  if (!handlers) subscribers.set(namespace, (handlers = new Set()));
+export function subscribeMap(map: Map<string, Set<Handler>>, namespace: string, handler: Handler): () => void {
+  let handlers = map.get(namespace);
+  if (!handlers) map.set(namespace, (handlers = new Set()));
   handlers.add(handler);
   return () => {
     handlers.delete(handler);
-    if (handlers.size === 0 && subscribers.get(namespace) === handlers) subscribers.delete(namespace);
+    if (handlers.size === 0 && map.get(namespace) === handlers) map.delete(namespace);
   };
 }
 
-export function emitInvalidation(msg: InvalidationPush): void {
-  for (const handler of subscribers.get(msg.namespace) ?? []) {
+export function emitMap(map: Map<string, Set<Handler>>, msg: InvalidationPush, log = debug): void {
+  for (const handler of map.get(msg.namespace) ?? []) {
     try {
       handler(msg);
     } catch (error) {
-      debug('local invalidation subscriber failed: %s', error);
+      log('invalidation handler failed: %s', error);
     }
   }
 }
+
+export const subscribeInvalidations = (namespace: string, handler: Handler): (() => void) =>
+  subscribeMap(subscribers, namespace, handler);
+
+export const emitInvalidation = (msg: InvalidationPush): void => emitMap(subscribers, msg);
