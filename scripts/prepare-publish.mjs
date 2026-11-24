@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -9,6 +9,7 @@ const outDir = path.join(rootDir, 'dist-publish');
 
 const CANONICAL_NAME = '@0xdoublesharp/lru-cache-clustered';
 const LEGACY_NAME = 'lru-cache-for-clusters-as-promised';
+const REQUIRED_DIST_FILES = ['index.js', 'index.cjs', 'index.d.ts', 'index.d.cts'];
 
 const CANONICAL_VERSION_BADGE =
   '[![npm](https://img.shields.io/npm/v/%400xdoublesharp%2Flru-cache-clustered.svg)](https://www.npmjs.com/package/@0xdoublesharp/lru-cache-clustered)';
@@ -53,8 +54,10 @@ const variants = [
 
 for (const variant of variants) {
   const variantDir = path.join(outDir, variant.dir);
+  const variantDistDir = path.join(variantDir, 'dist');
   await mkdir(variantDir, { recursive: true });
-  await cp(distDir, path.join(variantDir, 'dist'), { recursive: true });
+  await cp(distDir, variantDistDir, { recursive: true, dereference: true });
+  await assertStagedDist(variantDistDir);
 
   const manifest = buildPublishManifest(packageJson, variant.name);
   await Promise.all([
@@ -66,10 +69,9 @@ for (const variant of variants) {
 }
 
 async function assertBuilt() {
-  const requiredFiles = ['index.js', 'index.cjs', 'index.d.ts', 'index.d.cts'];
   const missing = [];
 
-  for (const file of requiredFiles) {
+  for (const file of REQUIRED_DIST_FILES) {
     try {
       await stat(path.join(distDir, file));
     } catch {
@@ -79,6 +81,19 @@ async function assertBuilt() {
 
   if (missing.length > 0) {
     throw new Error(`Missing dist artifacts: ${missing.join(', ')}. Run \`pnpm build\` before publishing.`);
+  }
+}
+
+async function assertStagedDist(stagedDistDir) {
+  const dirInfo = await lstat(stagedDistDir);
+  if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) {
+    throw new Error(`Staged dist directory ${stagedDistDir} must be a real directory, not a symlink.`);
+  }
+  for (const file of REQUIRED_DIST_FILES) {
+    const fileInfo = await lstat(path.join(stagedDistDir, file));
+    if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) {
+      throw new Error(`Staged dist artifact ${file} in ${stagedDistDir} must be a regular file.`);
+    }
   }
 }
 
