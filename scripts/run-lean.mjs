@@ -12,9 +12,10 @@ const leanDir = path.join(rootDir, 'formal', 'lean');
 async function resolveLake() {
   const candidates = [process.env.LAKE_BIN, path.join(process.env.HOME ?? '', '.elan', 'bin', 'lake')].filter(Boolean);
   for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
     try {
-      await access(candidate);
-      return candidate;
+      await access(resolved);
+      return resolved;
     } catch {
       // try next candidate
     }

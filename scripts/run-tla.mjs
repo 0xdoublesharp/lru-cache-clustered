@@ -17,9 +17,10 @@ async function resolveJar() {
   ].filter(Boolean);
 
   for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
     try {
-      await access(candidate);
-      return candidate;
+      await access(resolved);
+      return resolved;
     } catch {
       // try next candidate
     }
@@ -63,7 +64,7 @@ function runTlc(jar, metaDir, spec) {
 }
 
 async function resolveMetaDir() {
-  if (process.env.TLC_METADIR) return process.env.TLC_METADIR;
+  if (process.env.TLC_METADIR) return path.resolve(process.env.TLC_METADIR);
   const scratchTmp = '/Volumes/Scratch/lru-cache-clustered/tmp';
   try {
     await access(scratchTmp);

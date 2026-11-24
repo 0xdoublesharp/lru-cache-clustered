@@ -226,9 +226,12 @@ RespectsNamespaceFloor ==
 
 \* ---- Liveness Property ----
 
-\* Once mutations stop (at MaxVer or quiescent), every worker eventually drains
-\* invalidations and converges to primary state.
+AllDrained ==
+  \A w \in Workers : Len(invQ[w]) = 0
+
+\* Under delivery fairness, invalidation queues eventually drain and every
+\* worker's L1 converges to the authoritative primary state.
 EventualConvergence ==
-  []((\A w \in Workers : Len(invQ[w]) = 0) \/ <>(NoStaleAfterDrain))
+  []<>(AllDrained /\ NoStaleAfterDrain)
 
 =============================================================================
