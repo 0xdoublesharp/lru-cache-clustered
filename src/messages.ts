@@ -73,10 +73,23 @@ type SerializedError = {
 };
 
 // TTLs align with the requested keys. null represents Infinity on JSON IPC.
-export type DispatchResult<T> = { value: T; version: number; ttls?: Array<number | null>; evictedKeys?: unknown[] };
+export type DispatchResult<T> = {
+  value: T;
+  version: number;
+  ttls?: Array<number | null>;
+  evictedKeys?: unknown[];
+  l1Value?: unknown;
+};
 
 export type Response = { id: string; source: Source } & (
-  | { ok: true; value: unknown; version?: number; ttls?: Array<number | null>; evictedKeys?: unknown[] }
+  | {
+      ok: true;
+      value: unknown;
+      version?: number;
+      ttls?: Array<number | null>;
+      evictedKeys?: unknown[];
+      l1Value?: unknown;
+    }
   | { ok: false; error: SerializedError }
 );
 

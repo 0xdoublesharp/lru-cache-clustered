@@ -77,7 +77,7 @@ export class LocalL1Cache<V extends {} = {}> {
   readonly #ttl?: number;
   #latestSeen = 0;
   readonly #pending = new Map<string, Set<L1Read>>();
-  readonly #stats: Omit<L1Stats, 'size'> = {
+  readonly #stats: Omit<L1Stats, 'size' | 'ipcAvoided'> = {
     enabled: true,
     hits: 0,
     misses: 0,
@@ -85,23 +85,20 @@ export class LocalL1Cache<V extends {} = {}> {
     invalidations: 0,
     evictions: 0,
     staleHits: 0,
-    ipcAvoided: 0,
   };
   readonly #emit: L1EmitFn;
 
   constructor(opts: L1ConstructorOptions) {
-    this.#emit = opts.emit ?? (() => undefined);
-    this.#ttl = opts.ttl;
+    const { max = 1000, ttl, updateAgeOnGet = true, allowStale = false, maxSize, emit } = opts;
+    this.#emit = emit ?? (() => undefined);
+    this.#ttl = ttl;
     this.#cache = new LRUCache({
-      max: opts.max ?? 1000,
-      ttl: opts.ttl,
-      updateAgeOnGet: opts.updateAgeOnGet ?? true,
-      allowStale: opts.allowStale ?? false,
-      maxSize: opts.maxSize,
-      // sizeCalculation is required when maxSize is set, but for v1 we don't
-      // expose it in the public LocalL1Options. If a caller passes maxSize,
-      // we use a 1-per-entry calculation as a placeholder.
-      sizeCalculation: opts.maxSize !== undefined ? () => 1 : undefined,
+      max,
+      ttl,
+      updateAgeOnGet,
+      allowStale,
+      maxSize,
+      sizeCalculation: maxSize !== undefined ? () => 1 : undefined,
       disposeAfter: (value: L1Envelope<V>, key: string, reason: LRUCache.DisposeReason) => {
         if (reason === 'evict') {
           this.#stats.evictions += 1;
@@ -118,13 +115,14 @@ export class LocalL1Cache<V extends {} = {}> {
         ? this.#cache.get(encodedKey, { status })
         : this.#cache.peek(encodedKey, { allowStale: mode !== 'has' && this.#cache.allowStale });
     if (mode === 'peek' && entry && this.#cache.getRemainingTTL(encodedKey) < 0) status.returnedStale = true;
+    const s = this.#stats;
     if (entry) {
       const expired =
         entry.version < this.#latestSeen || (entry.expiresAt !== undefined && perfNow() >= entry.expiresAt);
       if (expired || status.returnedStale) {
         // Neither a local sliding TTL nor allowStale may extend the primary's
         // expiration deadline or revive a value invalidated by a write.
-        this.#stats.staleHits += 1;
+        s.staleHits += 1;
         this.#emit('stale-hit', { key: entry.key });
         if (expired) {
           this.#cache.delete(encodedKey);
@@ -133,12 +131,11 @@ export class LocalL1Cache<V extends {} = {}> {
       }
     }
     if (!entry) {
-      this.#stats.misses += 1;
+      s.misses += 1;
       this.#emit('miss', { key: eventKey });
       return undefined;
     }
-    this.#stats.hits += 1;
-    this.#stats.ipcAvoided += 1;
+    s.hits += 1;
     this.#emit('hit', { key: entry.key });
     return entry.value;
   }
@@ -222,7 +219,7 @@ export class LocalL1Cache<V extends {} = {}> {
   }
 
   stats(): L1Stats {
-    return { ...this.#stats, size: this.#cache.size };
+    return { ...this.#stats, size: this.#cache.size, ipcAvoided: this.#stats.hits };
   }
 
   // For tests / explicit teardown.

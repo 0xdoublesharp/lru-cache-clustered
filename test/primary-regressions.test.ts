@@ -713,3 +713,156 @@ void test('reentrant write during destroy preserves the recreated namespace vers
     await second.destroy();
   }
 });
+
+void test('counter resize at expiry boundary preserves expiry and does not overflow autopurge timers', (t) => {
+  let now = 1_000;
+  t.mock.method(performance, 'now', () => now);
+  const boundaryNs = 'primary-counter-resize-boundary';
+  const autopurgeNs = 'primary-counter-resize-autopurge';
+  const warnings: Error[] = [];
+  const onWarning = (w: Error) => warnings.push(w);
+  process.on('warning', onWarning);
+  try {
+    request(boundaryNs, 'init', { options: { maxSize: 10 } });
+    assert.equal(
+      (request(boundaryNs, 'incr', { key: 'k', amount: 1, size: 1, ttl: 50 }) as { value: number }).value,
+      1,
+    );
+    now = 1_050;
+    assert.equal((request(boundaryNs, 'incr', { key: 'k', amount: 0, size: 2 }) as { value: number }).value, 1);
+    const infoAtBoundary = caches.get(boundaryNs)?.info('k');
+    assert.equal(infoAtBoundary?.size, 2);
+    assert.equal(infoAtBoundary?.ttl, 0, 'resizing at exact expiry must not make entry non-expiring');
+    now = 1_051;
+    assert.ok((caches.get(boundaryNs)?.info('k')?.ttl ?? 0) < 0, 'entry must expire after its original deadline');
+
+    now = 2_000;
+    request(autopurgeNs, 'init', { options: { maxSize: 10, ttlAutopurge: true } });
+    request(autopurgeNs, 'set', { key: 'prime', value: 1, size: 1, ttl: 100 });
+    request(autopurgeNs, 'getRemainingTTL', { key: 'prime' });
+    now = 2_001;
+    request(autopurgeNs, 'incr', { key: 'k', amount: 1, size: 1, ttl: 2_147_483_646 });
+    const resized = request(autopurgeNs, 'incr', { key: 'k', amount: 0, size: 2 });
+    assert.equal(resized.ok, true);
+    assert.equal(
+      warnings.some((w) => w.name === 'TimeoutOverflowWarning'),
+      false,
+      'resizing a max-TTL autopurge counter must not overflow setTimeout',
+    );
+  } finally {
+    process.off('warning', onWarning);
+    request(boundaryNs, 'destroy');
+    request(autopurgeNs, 'destroy');
+  }
+});
+
+void test('forceRefresh does not discard an oversize fetchStore result owed to registered followers', () => {
+  const namespace = 'primary-oversize-fetch-force-refresh';
+  const state = (globalThis as Record<PropertyKey, unknown>)[Symbol.for('lru-cache-clustered.primary')] as {
+    fetchLocks: Map<string, Map<unknown, unknown>>;
+  };
+  try {
+    request(namespace, 'init', { options: { maxSize: 5 } });
+    const l1 = request(namespace, 'fetchClaim', { key: 'k', requestId: 'l1' });
+    const f1 = request(namespace, 'fetchClaim', { key: 'k', requestId: 'f1' });
+    assert.ok(l1.ok && f1.ok);
+    const tok1 = (l1.value as { token: string }).token;
+    const gen1 = (f1.value as { generation: string }).generation;
+
+    // Leader 1 completes with an oversize value owed to f1.
+    assert.equal(request(namespace, 'fetchStore', { key: 'k', token: tok1, value: 'big-val', size: 6 }).ok, true);
+
+    // Before f1 polls, a forced refresh starts and finishes with a smaller value.
+    const l2 = request(namespace, 'fetchClaim', { key: 'k', requestId: 'l2', forceRefresh: true });
+    assert.ok(l2.ok);
+    const tok2 = (l2.value as { token: string }).token;
+    assert.equal(request(namespace, 'fetchStore', { key: 'k', token: tok2, value: 'refreshed', size: 1 }).ok, true);
+
+    // f1 must still receive 'big-val' and prune the lock; new readers see 'refreshed'.
+    const f1Res = request(namespace, 'fetchClaim', { key: 'k', requestId: 'f1', generation: gen1 });
+    assert.ok(f1Res.ok);
+    assert.deepEqual(f1Res.value, { kind: 'value', value: 'big-val' });
+    assert.equal(state.fetchLocks.has(namespace), false);
+    assert.equal((request(namespace, 'get', { key: 'k' }) as { value: unknown }).value, 'refreshed');
+
+    // Also verify fetchRelease prunes unconsumed resolved follower entries even after generation changes.
+    const l3 = request(namespace, 'fetchClaim', { key: 'k2', requestId: 'l3' });
+    const f2 = request(namespace, 'fetchClaim', { key: 'k2', requestId: 'f2' });
+    assert.ok(l3.ok && f2.ok);
+    const tok3 = (l3.value as { token: string }).token;
+    const gen2 = (f2.value as { generation: string }).generation;
+    request(namespace, 'fetchStore', { key: 'k2', token: tok3, value: 'big-2', size: 6 });
+    const l4 = request(namespace, 'fetchClaim', { key: 'k2', requestId: 'l4', forceRefresh: true });
+    assert.ok(l4.ok);
+    request(namespace, 'fetchStore', {
+      key: 'k2',
+      token: (l4.value as { token: string }).token,
+      value: 'ok',
+      size: 1,
+    });
+    assert.equal(
+      (request(namespace, 'fetchRelease', { key: 'k2', requestId: 'f2', generation: gen2 }) as { value: boolean })
+        .value,
+      true,
+    );
+    assert.equal(state.fetchLocks.has(namespace), false);
+
+    // Worker disconnect also cleans up unconsumed resolved follower entries.
+    const l5 = handleRequest(
+      { id: 'r1', source: SOURCE, namespace, op: 'fetchClaim', key: 'k3', requestId: 'l5' },
+      { workerId: 8801 },
+    );
+    const f3 = handleRequest(
+      { id: 'r2', source: SOURCE, namespace, op: 'fetchClaim', key: 'k3', requestId: 'f3' },
+      { workerId: 8802 },
+    );
+    assert.ok(l5.ok && f3.ok);
+    request(namespace, 'fetchStore', {
+      key: 'k3',
+      token: (l5.value as { token: string }).token,
+      value: 'big-3',
+      size: 6,
+    });
+    cluster.emit('disconnect', { id: 8802 } as unknown as import('node:cluster').Worker);
+    assert.equal(state.fetchLocks.has(namespace), false, 'worker disconnect must prune resolved follower entries');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('JSON-coerced null sizes in incr and mSet reject instead of falling back', () => {
+  const namespace = 'primary-json-null-size';
+  try {
+    request(namespace, 'init', { options: { maxSize: 10 } });
+    assert.equal((request(namespace, 'incr', { key: 'c', amount: 1, size: 1 }) as { value: number }).value, 1);
+    assert.equal(request(namespace, 'incr', { key: 'c', amount: 1, size: null }).ok, false);
+    assert.equal((request(namespace, 'get', { key: 'c' }) as { value: number }).value, 1);
+    assert.equal(request(namespace, 'mSet', { entries: [['a', 1, { size: null }]], size: 1 }).ok, false);
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('eager L1 fill uses a fresh TTL sample so entries do not outlive their primary deadline', async (t) => {
+  let now = 1_000;
+  t.mock.method(performance, 'now', () => now);
+  const namespace = 'primary-fresh-l1-ttl';
+  const cache = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    ttl: 50,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  try {
+    await cache.set('prime', 'p');
+    await cache.getRemainingTTL('prime'); // primes lru-cache cachedNow at 1000
+    now = 1_000.75;
+    await cache.set('k', 'v', { ttl: 1, updateL1: true });
+    await new Promise((r) => setTimeout(r, 5)); // let primary cachedNow expire
+    now = 1_002.1;
+    assert.equal(await cache.withoutLocal().get('k'), undefined);
+    assert.equal(await cache.get('k'), undefined, 'L1 entry must not outlive primary deadline');
+  } finally {
+    await cache.destroy();
+  }
+});

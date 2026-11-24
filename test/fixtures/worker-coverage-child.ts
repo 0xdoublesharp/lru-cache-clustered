@@ -189,16 +189,41 @@ async function exerciseWorkerL1SnapshotAndCounterJsonIpc() {
     assert.deepEqual(await cache.get('fetched'), { nested: 10 });
     assert.deepEqual(await cache.withoutLocal().get('fetched'), { nested: 10 });
 
-    // JSON-serializable objects with toJSON() must work with updateL1: true under JSON IPC.
+    // JSON-serializable objects with toJSON() must run toJSON() once and match primary under JSON IPC.
+    let toJsonCalls = 0;
     const customJson = {
       secret: 'omit',
       toJSON() {
-        return { n: 1 };
+        return { n: ++toJsonCalls };
       },
     };
     assert.equal(await cache.set('tojson', customJson as unknown as { nested: number }, { updateL1: true }), true);
+    assert.equal(toJsonCalls, 1, 'toJSON must only run once during JSON IPC set');
     assert.deepEqual(await cache.get('tojson'), { n: 1 });
     assert.deepEqual(await cache.withoutLocal().get('tojson'), { n: 1 });
+
+    // Same single-toJSON and primary agreement for fetch() leader L1 fills.
+    let fetchToJsonCalls = 0;
+    await cache.fetch(
+      'tojson-fetch',
+      () =>
+        ({
+          toJSON() {
+            return { n: ++fetchToJsonCalls };
+          },
+        }) as unknown as { nested: number },
+    );
+    assert.equal(fetchToJsonCalls, 1, 'toJSON must only run once during JSON IPC fetchStore');
+    assert.deepEqual(await cache.get('tojson-fetch'), { n: 1 });
+    assert.deepEqual(await cache.withoutLocal().get('tojson-fetch'), { n: 1 });
+
+    // Buffer written over default JSON IPC with updateL1: true must match the primary's JSON representation.
+    assert.equal(
+      await cache.set('json-buf', Buffer.from([9]) as unknown as { nested: number }, { updateL1: true }),
+      true,
+    );
+    assert.deepEqual(await cache.get('json-buf'), await cache.withoutLocal().get('json-buf'));
+    assert.equal(Buffer.isBuffer(await cache.get('json-buf')), false);
 
     // JSON IPC serializes Infinity/NaN to null; primary must still reject instead of incrementing by 1.
     await assert.rejects(cache.incr('counter', Number.POSITIVE_INFINITY), /invalid amount/i);

@@ -42,7 +42,7 @@ type FetchLock = {
   ownerWorkerId?: number;
   requestId?: string;
   claimedAt: number;
-  resolvedValue?: NonNullish;
+  resolved?: Map<string, [NonNullish, number | undefined]>;
 };
 
 // Lease window for a fetch claim. If the leader hasn't called fetchStore
@@ -52,7 +52,7 @@ type FetchLock = {
 // cluster.on('exit') handler). 30s is generous for typical user fetchers
 // and short enough that hung-leader incidents do not park requests forever.
 export const FETCH_LEASE_MS = 30_000;
-export const SUPERSEDED_ERROR = 'Fetch was superseded and no current value remains';
+export const SUPERSEDED_ERROR = 'Fetch was superseded: no current value';
 
 type PrimaryState = {
   caches: Map<string, AnyCache>;
@@ -107,22 +107,13 @@ function getStats(namespace: string): Stats {
 
 function assertOptionsCompatible(namespace: string, cache: AnyCache, options?: SerializableLruOptions): void {
   if (!options) return;
-
   const current = cache as unknown as Required<SerializableLruOptions>;
-  const mismatches: string[] = [];
-
   for (const [key, value] of Object.entries(options) as Array<
     [keyof SerializableLruOptions, SerializableLruOptions[keyof SerializableLruOptions]]
   >) {
-    if (value === undefined) continue;
-    const expected = key === 'maxEntrySize' && !value ? current.maxSize : value;
-    if (current[key] !== expected) {
-      mismatches.push(`${key}=${String(current[key])} != ${String(value)}`);
+    if (value !== undefined && current[key] !== (key === 'maxEntrySize' && !value ? current.maxSize : value)) {
+      throw new Error(`Conflicting options (${namespace}): ${key}`);
     }
-  }
-
-  if (mismatches.length > 0) {
-    throw new Error(`Conflicting options (${namespace}): ${mismatches.join(', ')}`);
   }
 }
 
@@ -152,6 +143,7 @@ function recordKeyWrite(namespace: string, key: NonNullish, stored: boolean): vo
 }
 
 const ALLOW_STALE = { allowStale: true } as const;
+const FRESH = { allowStale: false } as const;
 
 function writeEntry(
   cache: AnyCache,
@@ -162,6 +154,9 @@ function writeEntry(
 ): boolean {
   const { ttl, size } = opts;
   if (!keepTTL) validateTtl(ttl, cache.ttlAutopurge);
+  let setOpts: LRUCache.SetOptions<NonNullish, NonNullish, unknown> = keepTTL
+    ? { size, noUpdateTTL: true }
+    : { ttl, size };
   if (
     cache.maxEntrySize &&
     Number.isInteger(size) &&
@@ -169,12 +164,14 @@ function writeEntry(
     cache.peek(key, ALLOW_STALE) === value &&
     cache.info(key)?.size !== size
   ) {
-    const rem = keepTTL ? cache.getRemainingTTL(key) : ttl;
+    const status: LRUCache.Status<NonNullish, NonNullish> = {};
+    if (keepTTL) {
+      cache.has(key, { updateAgeOnHas: false, status });
+      setOpts = { ttl: status.ttl ?? 0, start: status.start, size };
+    }
     cache.delete(key);
-    cache.set(key, value, { ttl: rem === undefined || Number.isFinite(rem) ? rem : 0, size });
-  } else {
-    cache.set(key, value, keepTTL ? { size, noUpdateTTL: true } : { ttl, size });
   }
+  cache.set(key, value, setOpts);
   return cache.peek(key, ALLOW_STALE) !== undefined;
 }
 
@@ -189,16 +186,15 @@ function supersedeFetch(namespace: string, key: NonNullish): boolean {
   return removed;
 }
 
-function pruneFetchLock(namespace: string, key: NonNullish, lock: FetchLock): void {
-  if (!lock.token && lock.followers.size === 0) supersedeFetch(namespace, key);
+function pruneFetchLock(namespace: string, key: NonNullish, lock?: FetchLock): void {
+  if (lock && !lock.token && !lock.followers.size && !lock.resolved?.size) supersedeFetch(namespace, key);
 }
 
 function releaseFetchLocksForWorker(workerId: number): void {
   for (const [namespace, locks] of fetchLocks) {
     for (const [key, lock] of locks) {
-      for (const [requestId, owner] of lock.followers) {
-        if (owner === workerId) lock.followers.delete(requestId);
-      }
+      for (const [id, owner] of lock.followers) if (owner === workerId) lock.followers.delete(id);
+      for (const [id, [, owner]] of lock.resolved ?? []) if (owner === workerId) lock.resolved!.delete(id);
       if (lock.ownerWorkerId === workerId) clearLeader(lock);
       pruneFetchLock(namespace, key, lock);
     }
@@ -280,7 +276,7 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'setIfAbsent': {
       const cache = getCache();
       const key = requireKey(payload.key);
-      if (cache.peek(key, { allowStale: false }) !== undefined) return false;
+      if (cache.peek(key, FRESH) !== undefined) return false;
       const value = requireValue(payload.value);
       validateTtl(payload.ttl, cache.ttlAutopurge);
       if (exceedsEntrySize(cache, payload.size)) return false;
@@ -320,7 +316,12 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const entries = payload.entries.map(([key, value, entryOpts]) => {
         const ttl = entryOpts?.ttl === undefined ? payload.ttl : entryOpts.ttl;
         validateTtl(ttl, cache.ttlAutopurge);
-        return [requireKey(key), requireValue(value), ttl, entryOpts?.size ?? payload.size] as const;
+        return [
+          requireKey(key),
+          requireValue(value),
+          ttl,
+          entryOpts?.size === undefined ? payload.size : entryOpts.size,
+        ] as const;
       });
       let changed = false;
       try {
@@ -391,11 +392,11 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const cache = getCache();
       const key = requireKey(payload.key);
       const amount = payload.amount === undefined ? 1 : payload.amount;
-      const current = cache.peek(key, { allowStale: false });
+      const current = cache.peek(key, FRESH);
       const existed = current !== undefined;
       const next = (typeof current === 'number' ? current : 0) + amount * (payload.op === 'decr' ? -1 : 1);
       if (!Number.isFinite(amount) || !Number.isFinite(next)) throw new TypeError('invalid amount');
-      const size = payload.size ?? (existed ? cache.info(key)?.size : undefined);
+      const size = payload.size === undefined ? (existed ? cache.info(key)?.size : undefined) : payload.size;
       if (exceedsEntrySize(cache, size)) throw new RangeError('invalid size');
       writeEntry(cache, key, next, { ttl: payload.ttl, size }, existed);
       recordKeyWrite(namespace, key, true);
@@ -404,6 +405,14 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'fetchClaim': {
       const key = requireKey(payload.key);
       const existing = getLock(key);
+      const reqId = payload.requestId;
+      const delivered = reqId ? existing?.resolved?.get(reqId) : undefined;
+      if (delivered) {
+        existing!.resolved!.delete(reqId!);
+        pruneFetchLock(namespace, key, existing);
+        getStats(namespace).hits += 1;
+        return { kind: 'value', value: delivered[0] };
+      }
       if (payload.generation !== undefined && existing?.generation !== payload.generation) {
         const value = caches.get(namespace)?.get(key);
         if (value !== undefined) return { kind: 'value', value };
@@ -412,33 +421,34 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       const cache = getCache();
       const now = Date.now();
       if (!payload.forceRefresh) {
-        const value = cache.get(key) ?? existing?.resolvedValue;
+        const value = cache.get(key);
         const s = getStats(namespace);
         if (value !== undefined) {
-          if (payload.requestId) existing?.followers.delete(payload.requestId);
-          if (existing) pruneFetchLock(namespace, key, existing);
+          if (reqId) existing?.followers.delete(reqId);
+          pruneFetchLock(namespace, key, existing);
           s.hits += 1;
           return { kind: 'value', value };
         }
         if (payload.generation === undefined) s.misses += 1;
         if (existing?.token && now - existing.claimedAt < FETCH_LEASE_MS) {
-          if (payload.requestId) {
-            existing.followers.set(payload.requestId, context.workerId);
+          if (reqId) {
+            existing.followers.set(reqId, context.workerId);
             return { kind: 'follower', generation: existing.generation };
           }
           return { kind: 'follower' };
         }
       }
       const token = `fetch-${++primaryState.nextFetchToken}`;
-      if (payload.requestId) existing?.followers.delete(payload.requestId);
+      if (reqId) existing?.followers.delete(reqId);
       let nsLocks = fetchLocks.get(namespace);
       if (!nsLocks) fetchLocks.set(namespace, (nsLocks = new Map<NonNullish, FetchLock>()));
       nsLocks.set(key, {
         token,
-        generation: existing?.generation ?? token,
+        generation: existing?.token || existing?.followers.size ? existing.generation : token,
         followers: existing?.followers ?? new Map<string, number | undefined>(),
+        resolved: existing?.resolved,
         ownerWorkerId: context.workerId,
-        requestId: payload.requestId,
+        requestId: reqId,
         claimedAt: now,
       });
       return { kind: 'leader', token };
@@ -449,13 +459,15 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       if (!lock || lock.token !== payload.token) return false;
       const value = requireValue(payload.value);
       const stored = writeEntry(getCache(), key, value, payload);
-      if (stored || lock.followers.size === 0) {
-        recordKeyWrite(namespace, key, stored);
-      } else {
-        clearLeader(lock);
-        lock.resolvedValue = value;
-        bumpNamespaceVersion(namespace);
+      if (stored) getStats(namespace).sets += 1;
+      else if (lock.followers.size) {
+        const resolved = (lock.resolved ??= new Map());
+        for (const [id, wid] of lock.followers) resolved.set(id, [value, wid]);
       }
+      lock.followers.clear();
+      clearLeader(lock);
+      pruneFetchLock(namespace, key, lock);
+      bumpNamespaceVersion(namespace);
       return true;
     }
     case 'fetchAbort': {
@@ -469,11 +481,14 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'fetchRelease': {
       const key = requireKey(payload.key);
       const lock = getLock(key);
-      if (!lock || (payload.generation !== undefined && lock.generation !== payload.generation)) return false;
-      let removed = lock.followers.delete(payload.requestId);
-      if (lock.requestId !== undefined && lock.requestId === payload.requestId) {
-        clearLeader(lock);
-        removed = true;
+      if (!lock) return false;
+      let removed = lock.resolved?.delete(payload.requestId) ?? false;
+      if (payload.generation === undefined || lock.generation === payload.generation) {
+        if (lock.followers.delete(payload.requestId)) removed = true;
+        if (lock.requestId !== undefined && lock.requestId === payload.requestId) {
+          clearLeader(lock);
+          removed = true;
+        }
       }
       pruneFetchLock(namespace, key, lock);
       return removed;
@@ -596,9 +611,10 @@ export function dispatchAndBroadcast(
     const keys = payload.op === 'mGet' ? payload.keys : 'key' in payload ? [payload.key] : [];
     const cache = caches.get(namespace);
     result.ttls = keys.map((key) => {
-      const ttl = cache?.getRemainingTTL(requireKey(key)) ?? 0;
-      return Number.isFinite(ttl) ? ttl : null;
+      const info = cache?.info(requireKey(key));
+      return info ? (info.ttl ?? null) : 0;
     });
+    if (value === true && (payload.op === 'set' || payload.op === 'fetchStore')) result.l1Value = payload.value;
   }
   return result;
 }

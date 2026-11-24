@@ -73,8 +73,8 @@ export function createIpcClient(proc: ProcessLike): IpcClient {
       callbacks.set(id, (response) => {
         clearTimeout(timer);
         if (response.ok) {
-          const { value, version = 0, ttls, evictedKeys } = response;
-          resolve({ value: value as T, version, ttls, evictedKeys });
+          const { value, version = 0, ttls, evictedKeys, l1Value } = response;
+          resolve({ value: value as T, version, ttls, evictedKeys, l1Value });
         } else reject(deserializeError(response.error));
       });
 
@@ -145,10 +145,7 @@ export function getDefaultClient(): IpcClient {
     if (typeof process.send !== 'function') {
       throw new Error('not a cluster worker');
     }
-    cachedDefaultClient = createIpcClient({
-      send: process.send.bind(process),
-      on: process.on.bind(process),
-    });
+    cachedDefaultClient = createIpcClient(process as unknown as ProcessLike);
   }
   return cachedDefaultClient;
 }
