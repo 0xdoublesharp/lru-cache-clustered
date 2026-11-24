@@ -112,8 +112,9 @@ def fetchClaim {V : Type} (s : NamespaceState V) (reqId : Nat) (gen : Option Nat
             (ClaimOutcome.follower lk.generation, { sNs with lock := some { lk with followers := nextFollowers } })
           else
             let tok := sNs.nextToken + 1
+            let remFollowers := lk.followers.filter (· != reqId)
             let newLk : FetchLock :=
-              { token := some tok, generation := lk.generation, ownerRequestId := some reqId, followers := lk.followers }
+              { token := some tok, generation := lk.generation, ownerRequestId := some reqId, followers := remFollowers }
             (ClaimOutcome.leader tok, { sNs with lock := some newLk, nextToken := tok })
         | none =>
           let tok := sNs.nextToken + 1
@@ -123,7 +124,7 @@ def fetchClaim {V : Type} (s : NamespaceState V) (reqId : Nat) (gen : Option Nat
     else
       let tok := sNs.nextToken + 1
       let (newGen, newFollowers) := match sNs.lock with
-        | some lk => (lk.generation, lk.followers)
+        | some lk => (lk.generation, lk.followers.filter (· != reqId))
         | none => (tok, [])
       let newLk : FetchLock :=
         { token := some tok, generation := newGen, ownerRequestId := some reqId, followers := newFollowers }
@@ -184,5 +185,19 @@ theorem fetchRelease_clears_timed_out_leader {V : Type}
     let (removed, sReleased) := fetchRelease sClaimed reqId none
     removed = true ∧ sReleased.lock = none := by
   simp [fetchClaim, fetchRelease, hMiss, hNoLock]
+
+/-- When the sole waiting follower is promoted to leader after the previous leader aborted,
+    its follower entry is removed immediately so a subsequent `fetchAbort` prunes the lock. -/
+theorem promoted_follower_abort_prunes_lock {V : Type}
+    (s : NamespaceState V) (reqId gen : Nat)
+    (hMiss : s.cached = none)
+    (hLock : s.lock = some { token := none, generation := gen, ownerRequestId := none, followers := [reqId] }) :
+    let (outcome, sPromoted) := fetchClaim s reqId (some gen) false true
+    match outcome with
+    | ClaimOutcome.leader tok =>
+      let (aborted, sAborted) := fetchAbort sPromoted tok
+      aborted = true ∧ sAborted.lock = none
+    | _ => False := by
+  simp [fetchClaim, fetchAbort, hMiss, hLock]
 
 end LruCacheClustered.Fetch

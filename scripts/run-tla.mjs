@@ -62,8 +62,19 @@ function runTlc(jar, metaDir, spec) {
   });
 }
 
+async function resolveMetaDir() {
+  if (process.env.TLC_METADIR) return process.env.TLC_METADIR;
+  const scratchTmp = '/Volumes/Scratch/lru-cache-clustered/tmp';
+  try {
+    await access(scratchTmp);
+    return path.join(scratchTmp, 'tlc-states');
+  } catch {
+    return path.join(tlaDir, 'states');
+  }
+}
+
 const jar = await resolveJar();
-const metaDir = process.env.TLC_METADIR ?? '/Volumes/Scratch/lru-cache-clustered/tmp/tlc-states';
+const metaDir = await resolveMetaDir();
 
 for (const spec of SPECS) {
   await runTlc(jar, metaDir, spec);

@@ -110,11 +110,12 @@ ProcessClaim(c) ==
                   /\ lockToken' = tok
                   /\ lockGen' = gen
                   /\ lockOwner' = c
+                  /\ lockFollowers' = lockFollowers \ {c}
                   /\ lockExpired' = FALSE
                   /\ cState' = [cState EXCEPT ![c] = "leader"]
                   /\ cTok' = [cTok EXCEPT ![c] = tok]
                   /\ cForce' = [cForce EXCEPT ![c] = FALSE]
-                  /\ UNCHANGED <<cacheVal, lockFollowers, cGen, cVal>>
+                  /\ UNCHANGED <<cacheVal, cGen, cVal>>
 
 \* Leader completes fetcher and executes fetchStore (plus existingOnly fallback on supersede)
 LeaderStore(c, v) ==
@@ -301,5 +302,9 @@ NoOrphanedLockWhenSettled ==
 \* A non-empty lock always has either a live token or at least one registered follower.
 NoEmptyLock ==
   lockPresent => (lockHasToken \/ lockFollowers /= {})
+
+\* An active leader is never simultaneously registered in its own follower set.
+LeaderNotInFollowers ==
+  (lockPresent /\ lockHasToken) => lockOwner \notin lockFollowers
 
 =============================================================================
