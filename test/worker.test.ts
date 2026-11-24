@@ -408,3 +408,20 @@ void test('malformed nested error causes cannot crash or consume the pending res
   fake.deliver({ id: sent.id, source: SOURCE, ok: true, value: 'still pending' });
   assert.equal(await p, 'still pending');
 });
+
+void test('isInvalidationPush ignores pushes with NaN or non-finite version', () => {
+  let listener: ((msg: unknown) => void) | undefined;
+  const client = createIpcClient({
+    send: () => true,
+    on(_e: 'message', cb: (msg: unknown) => void) {
+      listener = cb;
+    },
+  });
+  const got: unknown[] = [];
+  client.subscribeInvalidations('users', (m) => got.push(m));
+  for (const version of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    listener?.({ source: SOURCE, push: 'l1:invalidate-namespace', namespace: 'users', version });
+    listener?.({ source: SOURCE, push: 'l1:invalidate', namespace: 'users', key: 'k', version });
+  }
+  assert.equal(got.length, 0, 'non-finite version pushes must be rejected');
+});

@@ -154,7 +154,7 @@ export function isOurMessage(value: unknown): value is Record<string, unknown> {
 }
 
 export function isInvalidationPush(value: unknown): value is InvalidationPush {
-  if (!isOurMessage(value) || typeof value.namespace !== 'string' || typeof value.version !== 'number') {
+  if (!isOurMessage(value) || typeof value.namespace !== 'string' || !Number.isFinite(value.version)) {
     return false;
   }
   return value.push === 'l1:invalidate' || value.push === 'l1:invalidate-namespace';
