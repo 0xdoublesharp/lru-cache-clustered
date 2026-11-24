@@ -170,7 +170,12 @@ export class LocalL1Cache<V extends {} = {}> {
     eventKey: unknown = encodedKey,
     read?: L1Read,
   ): void {
-    if (version < this.#latestSeen || (read && (read.cancelled || version < read.version))) {
+    const existing = this.#cache.peek(encodedKey, { allowStale: true });
+    if (
+      version < this.#latestSeen ||
+      (existing !== undefined && version < existing.version) ||
+      (read && (read.cancelled || version < read.version))
+    ) {
       // Don't store an entry already known to be stale.
       return;
     }
@@ -213,18 +218,16 @@ export class LocalL1Cache<V extends {} = {}> {
   }
 
   clear(emit = true, version?: number): void {
+    let invalidated = false;
     if (version === undefined) {
       for (const pending of this.#pending.values()) {
         for (const read of pending) read.cancelled = true;
       }
-    } else {
-      this.advanceLatestSeen(version);
-    }
-    let invalidated = false;
-    if (version === undefined) {
       invalidated = this.#cache.size > 0;
       this.#cache.clear();
     } else {
+      this.advanceLatestSeen(version);
+      if (!this.#cache.allowStale) this.#cache.purgeStale();
       for (const [key, entry] of this.#cache.entries()) {
         if (entry.version < version) {
           this.#cache.delete(key);

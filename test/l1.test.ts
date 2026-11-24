@@ -341,3 +341,72 @@ void test('key invalidation fences only active reads of that key', () => {
   next.release();
   next.release();
 });
+
+void test('LocalL1Cache.set rejects an older version when a newer version is already cached', () => {
+  const l1 = new LocalL1Cache<string>({ max: 10, ttl: 5000 });
+  l1.set('s:k', 'newer', 5, undefined, 'k');
+  l1.set('s:k', 'older', 3, undefined, 'k');
+  assert.equal(l1.get('s:k', 'k'), 'newer');
+  assert.equal(l1.stats().sets, 1);
+});
+
+void test('LocalL1Cache.clear with version purges already-expired entries when allowStale is false', (t) => {
+  let now = 1000;
+  t.mock.method(performance, 'now', () => now);
+  const l1 = new LocalL1Cache<string>({ max: 10, ttl: 50, allowStale: false });
+  l1.set('s:expired', 'v1', 1, 50, 'expired');
+  now += 100;
+  l1.clear(false, 2);
+  assert.equal(l1.stats().size, 0, 'expired entries must not linger after versioned clear');
+
+  const staleAllowed = new LocalL1Cache<string>({ max: 10, ttl: 50, allowStale: true });
+  staleAllowed.set('s:old', 'v1', 1, 50, 'old');
+  staleAllowed.set('s:new', 'v3', 3, 50, 'new');
+  staleAllowed.clear(false, 2);
+  assert.equal(staleAllowed.stats().size, 1, 'allowStale versioned clear keeps entries at or above version');
+});
+
+void test('normalizeL1 honors explicit localL1.ttl below 100ms and clamps derived default to short primary ttl', async (t) => {
+  let now = 1000;
+  t.mock.method(performance, 'now', () => now);
+  const explicitShort = new LRUCacheClustered<string, string>({
+    namespace: 'l1-explicit-short-ttl',
+    max: 10,
+    ttl: 60_000,
+    localL1: { experimental: true, ttl: 25, updateAgeOnGet: false, invalidation: 'ttl-only' },
+  });
+  const derivedShortPrimary = new LRUCacheClustered<string, string>({
+    namespace: 'l1-derived-short-primary',
+    max: 10,
+    ttl: 40,
+    localL1: { experimental: true, updateAgeOnGet: false, invalidation: 'ttl-only' },
+  });
+  try {
+    await explicitShort.set('k', 'v1');
+    assert.equal(await explicitShort.get('k'), 'v1');
+    explicitShort.getCache()!.set('k', 'v2');
+    now += 35; // > 25ms explicit L1 TTL, < 100ms old bogus floor
+    assert.equal(await explicitShort.get('k'), 'v2', 'explicit 25ms localL1.ttl must expire before 100ms');
+
+    await derivedShortPrimary.set('k', 'v1', { ttl: 5_000 });
+    assert.equal(await derivedShortPrimary.get('k'), 'v1');
+    derivedShortPrimary.getCache()!.set('k', 'v2', { ttl: 5_000 });
+    now += 50; // > 40ms primary default ttl, < 100ms old bogus floor
+    assert.equal(await derivedShortPrimary.get('k'), 'v2', 'derived L1 TTL must clamp to primary.ttl');
+
+    for (const badTtl of [0, -10, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () =>
+          new LRUCacheClustered({
+            namespace: 'l1-bad-ttl',
+            max: 10,
+            localL1: { experimental: true, ttl: badTtl },
+          }),
+        /invalid localL1\.ttl/,
+      );
+    }
+  } finally {
+    await explicitShort.destroy();
+    await derivedShortPrimary.destroy();
+  }
+});

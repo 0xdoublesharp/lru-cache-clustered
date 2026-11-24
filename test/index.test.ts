@@ -1,7 +1,7 @@
 import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LRUCacheClustered } from '../src/index.ts';
+import { LRUCacheClustered, type L1Stats, type SerializableLruOptions, type Stats } from '../src/index.ts';
 import { caches } from '../src/primary.ts';
 
 void test('primary-mode set/get/delete round-trip', async () => {
@@ -1629,4 +1629,51 @@ void test('L1 has preserves local recency', async () => {
   const before = cache.localStats()!.hits;
   assert.equal(await cache.get('b'), 2);
   assert.equal(cache.localStats()!.hits, before + 1);
+});
+
+void test('asyncIterator handles undefined entries (failsafe=resolve timeout) without throwing', async () => {
+  const cache = new LRUCacheClustered<string, number>({ namespace: 'iter-timeout', max: 10 });
+  cache.entries = async () => undefined as unknown as Array<[string, number]>;
+  const collected: Array<[string, number]> = [];
+  for await (const pair of cache) collected.push(pair);
+  assert.deepEqual(collected, []);
+  await cache.destroy();
+});
+
+void test('public Stats, L1Stats, and SerializableLruOptions types are exported from index', async () => {
+  const opts: SerializableLruOptions = { max: 5 };
+  const cache = new LRUCacheClustered<string, number>({
+    namespace: 'public-type-exports',
+    ...opts,
+    localL1: { experimental: true },
+  });
+  const s: Stats = await cache.stats();
+  const l1: L1Stats | undefined = cache.localStats();
+  assert.equal(s.namespace, 'public-type-exports');
+  assert.equal(l1?.enabled, true);
+  await cache.destroy();
+});
+
+void test('allowStale, max, and ttl preserve local options when primary returns undefined (failsafe timeout)', async () => {
+  const cache = new LRUCacheClustered<string, number>({
+    namespace: 'tunable-timeout-preserve',
+    max: 10,
+    ttl: 5000,
+    allowStale: true,
+  });
+  const inner = cache.getCache()!;
+  // Simulate undefined return on primary side as if failsafe='resolve' timed out.
+  Object.defineProperty(inner, 'max', { get: () => undefined, configurable: true });
+  Object.defineProperty(inner, 'ttl', { value: undefined, configurable: true, writable: true });
+  Object.defineProperty(inner, 'allowStale', { value: undefined, configurable: true, writable: true });
+  assert.equal(await cache.max(), undefined);
+  assert.equal(await cache.allowStale(), undefined);
+  assert.equal(await cache.ttl(), undefined);
+  await cache.destroy();
+  // Re-creating the namespace must still use the original options, not undefined.
+  await cache.set('k', 1);
+  assert.equal(await cache.max(), 10);
+  assert.equal(await cache.ttl(), 5000);
+  assert.equal(await cache.allowStale(), true);
+  await cache.destroy();
 });
