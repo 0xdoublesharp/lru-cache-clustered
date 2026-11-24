@@ -1,3 +1,12 @@
+# 2.1.5 / 2026-11-23
+
+- Update `packageManager` to `pnpm@12.21.0` and migrate `onlyBuiltDependencies` to `allowBuilds` in `pnpm-workspace.yaml`.
+- Update 13 direct development dependencies to their latest compatible releases meeting the seven-day release waiting policy (`@size-limit/file` 14.3.0, `@types/node` 26.6.6, `@typescript-eslint/eslint-plugin` and `@typescript-eslint/parser` 8.73.0, `c8` 12.0.0, `eslint` 10.15.0, `eslint-plugin-import-x` 4.18.1, `knip` 6.45.1, `lint-staged` 17.6.1, `prettier` 3.10.1, `size-limit` 14.3.0, `tsup` 9.0.0, and `type-coverage` 2.31.2).
+- Remove the `tsup>esbuild` override (now satisfied natively by `tsup@9.0.0`) and the temporary `eslint-plugin-import-x@4.17.1` minimatch compatibility patch (superseded by `eslint-plugin-import-x@4.18.1`).
+- Refresh the `glob` and `minimatch` security overrides to `14.0.6` and `11.0.9`.
+
+The runtime API, runtime dependencies, and Node.js 22 minimum are unchanged.
+
 # 2.1.4 / 2026-11-23
 
 ## Primary and single-flight fixes

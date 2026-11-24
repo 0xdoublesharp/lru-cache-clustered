@@ -40,7 +40,7 @@ Requires **Node.js 22 or newer**. Includes ESM and CommonJS builds and TypeScrip
 
 > `@0xdoublesharp/lru-cache-clustered` is the canonical package name. `lru-cache-for-clusters-as-promised` is published from the same build at the same version.
 
-**2.1.4** hardens primary cache validation, single-flight fetch coordination, worker listener attachment, and local L1 coherence, backed by TLA+ and Lean 4 formal verification. See the [release notes](./CHANGELOG.md#214--2026-11-23) for details.
+**2.1.5** is a maintenance release updating development tooling (`pnpm` 12, `tsup` 9, `c8` 12, `size-limit` 14, and security overrides) on top of the **2.1.4** reliability and formal-verification updates. See the [release notes](./CHANGELOG.md#215--2026-11-23) for details.
 
 ## Quick start
 

@@ -1,5 +1,7 @@
 # Dependency update, November 23, 2026
 
+Included in [v2.1.5](../CHANGELOG.md#215--2026-11-23).
+
 Updated `packageManager` to `pnpm@12.21.0` (the latest pnpm 12 release meeting the seven-day waiting policy) and updated 13 direct development dependencies to their latest compatible releases published at least seven days prior. The Node.js 22 runtime minimum, runtime dependencies (`debug`), and peer dependency (`lru-cache@^11`) remain unchanged.
 
 | Package / tool                     | Previous | Updated |
