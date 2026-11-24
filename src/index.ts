@@ -1,21 +1,28 @@
-import cluster from 'node:cluster';
-import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { deserialize, serialize } from 'node:v8';
 import type { LRUCache } from 'lru-cache';
 import {
   caches,
+  cluster,
   FETCH_LEASE_MS,
   SUPERSEDED_ERROR,
   buildInvalidation,
   dispatchAndBroadcast,
   getOrCreateCache,
   getNamespaceVersion,
+  hasOp,
   installClusterListener,
   type ExecPayload,
 } from './primary.js';
 import { getDefaultClient } from './worker.js';
 import { subscribeInvalidations, emitInvalidation } from './invalidation.js';
-import { type InvalidationPush, type DispatchResult, type SerializableLruOptions, type Stats } from './messages.js';
+import {
+  perfNow,
+  type InvalidationPush,
+  type DispatchResult,
+  type SerializableLruOptions,
+  type Stats,
+} from './messages.js';
 import { LocalL1Cache, encodeL1Key, type L1Stats, type L1Read } from './l1.js';
 
 if (cluster.isPrimary) installClusterListener();
@@ -87,27 +94,12 @@ type NormalizedL1 = {
 };
 
 function shouldEmitLocalInvalidation(payload: ExecPayload, value: unknown): boolean {
-  switch (payload.op) {
-    case 'set':
-    case 'mSet':
-    case 'mDelete':
-    case 'clear':
-    case 'load':
-    case 'incr':
-    case 'decr':
-      return true;
-    case 'delete':
-    case 'setIfAbsent':
-    case 'purgeStale':
-    case 'fetchStore':
-    case 'destroy':
-      return value === true;
-    case 'max':
-    case 'ttl':
-      return typeof payload.value === 'number';
-    default:
-      return false;
-  }
+  const { op } = payload;
+  if (op === 'max' || op === 'ttl') return typeof payload.value === 'number';
+  return (
+    hasOp(' set mSet mDelete clear load incr decr ', op) ||
+    (value === true && hasOp(' delete setIfAbsent purgeStale fetchStore destroy ', op))
+  );
 }
 
 function normalizeL1(
@@ -116,7 +108,7 @@ function normalizeL1(
 ): NormalizedL1 | undefined {
   if (!raw || raw.enabled === false) return undefined;
   if (!raw.experimental) {
-    throw new Error('localL1 is experimental. Pass `localL1: { experimental: true }` to opt in.');
+    throw new Error('localL1 requires experimental: true');
   }
 
   // Default L1 ttl: min(primaryTtl * 0.1, 5000), with 100ms floor before clamping
@@ -140,27 +132,25 @@ function normalizeL1(
     updateAgeOnGet: raw.updateAgeOnGet ?? true,
     allowStale: raw.allowStale ?? false,
     invalidation: raw.invalidation ?? 'broadcast',
-    methods: m
-      ? { get: m.get === true, has: m.has === true, fetch: m.fetch === true }
-      : { get: true, has: true, fetch: true },
+    methods: { get: !m || !!m.get, has: !m || !!m.has, fetch: !m || !!m.fetch },
   };
 }
 
 function assertPrimary(method: string): void {
-  if (cluster.isWorker) throw new Error(`LRUCacheClustered.${method}() must not be called from a worker`);
+  if (cluster.isWorker) throw new Error(`${method}() is primary-only`);
 }
 
-const snapshot = <T>(value: T, enabled: boolean): T =>
-  enabled && !cluster.isPrimary ? globalThis.structuredClone(value) : value;
-
-function encodeL1KeyOrUndefined(key: unknown): string | undefined {
-  if (key === undefined || key === null) return undefined;
+function snapshot<T>(value: T, enabled: boolean): T {
+  if (!enabled || cluster.isPrimary) return value;
   try {
-    return encodeL1Key(key);
+    return deserialize(serialize(value)) as T;
   } catch {
-    return undefined;
+    return JSON.parse(JSON.stringify(value)) as T;
   }
 }
+
+const encodeL1KeyOrUndefined = (key: unknown): string | undefined =>
+  key === undefined || key === null || typeof key === 'symbol' ? undefined : encodeL1Key(key);
 
 // K and V are constrained to non-nullish to mirror lru-cache@11's own signature
 // (`class LRUCache<K extends {}, V extends {}>`), since the primary enforces
@@ -246,7 +236,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
   }
   async set(key: K, value: V, opts?: WriteOptions): Promise<boolean> {
     this.#deleteLocal(key);
-    const updateL1 = !!this.#l1 && opts?.updateL1 === true;
+    const updateL1 = !!this.#l1 && !!opts?.updateL1;
     const l1Value = snapshot(value, updateL1);
     const read = updateL1 ? this.#trackLocalRead(key) : undefined;
     try {
@@ -444,16 +434,19 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
       get(t, prop): any {
         if (prop === 'withoutLocal') return () => wrapper;
         const v = Reflect.get(t, prop, t);
-        if (prop === 'get' || prop === 'has' || prop === 'peek' || prop === 'mGet' || prop === 'fetch') {
-          return (...args: unknown[]) => {
-            const i = prop === 'fetch' ? 2 : 1;
-            args[i] = { ...(args[i] as object | undefined), bypassL1: true };
-            return (v as (...a: unknown[]) => unknown).apply(t, args);
-          };
+        if (typeof v !== 'function') return v;
+        const fn = v as (...a: unknown[]) => unknown;
+        if (typeof prop === 'string') {
+          if (hasOp(' get has peek mGet fetch ', prop)) {
+            return (...args: unknown[]) => {
+              const i = prop === 'fetch' ? 2 : 1;
+              args[i] = { ...(args[i] as object | undefined), bypassL1: true };
+              return fn.apply(t, args);
+            };
+          }
+          if (hasOp(' on off once ', prop)) return (...args: unknown[]) => (fn.apply(t, args), wrapper);
         }
-        // All other properties: reflect from the real instance bound to it so
-        // private fields remain accessible.
-        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+        return fn.bind(t);
       },
     });
     return wrapper;
@@ -467,8 +460,9 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
   }
 
   async fetch(key: K, fetcher: (key: K) => Promise<V> | V, opts?: FetchOptions): Promise<V> {
-    const useFetchL1 = !!this.#l1Config?.methods.fetch && !opts?.bypassL1;
-    if (!opts?.forceRefresh) {
+    const bypass = opts?.bypassL1;
+    const useFetchL1 = !!this.#l1Config?.methods.fetch && !bypass;
+    if (!opts?.forceRefresh && !bypass) {
       if (useFetchL1) {
         const cachedLocal = this.#getLocal(key);
         if (cachedLocal !== undefined) return cachedLocal;
@@ -482,11 +476,11 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     const dispatchFetch = <T>(p: ExecPayload) => this.#dispatchWithMeta<T>(p, 'reject', this.#destroyEpoch === epoch);
     const read = useFetchL1 ? this.#trackLocalRead(key) : undefined;
     let slot!: { promise: Promise<V>; startedAt: number };
-    const requestId = randomUUID();
+    const requestId = globalThis.crypto.randomUUID();
     let generation: string | undefined;
     let claimPending = false;
     const run = async (): Promise<V> => {
-      let forceRefresh = opts?.forceRefresh === true;
+      let forceRefresh = !!opts?.forceRefresh;
 
       while (true) {
         claimPending = true;
@@ -639,7 +633,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     // Older primaries may omit TTL metadata. Serve the result without caching
     // it locally rather than guessing an expiration.
     if (enc === undefined || remaining === undefined) return;
-    const ttl = remaining === null ? undefined : remaining - (globalThis.performance.now() - response.ttlStart!);
+    const ttl = remaining === null ? undefined : remaining - (perfNow() - response.ttlStart!);
     this.#l1!.set(enc, value, response.version, ttl, key, read);
   }
 
@@ -675,20 +669,6 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     return this.#dispatch<number>({ op, key, amount, ttl: opts?.ttl, size: opts?.size });
   }
 
-  #emitLocalInvalidation(payload: ExecPayload, value: unknown, version: number): void {
-    const msg = shouldEmitLocalInvalidation(payload, value)
-      ? buildInvalidation(this.namespace, payload, version)
-      : undefined;
-    if (msg) {
-      this.#publishingOwnMutation = true;
-      try {
-        emitInvalidation(msg);
-      } finally {
-        this.#publishingOwnMutation = false;
-      }
-    }
-  }
-
   #invalidateOwnEvictions(result: DispatchResult<unknown>): void {
     for (const key of result.evictedKeys ?? []) this.#deleteLocal(key as K, result.version);
   }
@@ -705,14 +685,14 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     // destroy() releases subscriptions. Reusing the instance must restore
     // invalidation delivery before another read can warm its local cache.
     if (resubscribe && payload.op !== 'destroy' && payload.op !== 'init') this.#installL1Subscription();
-    const ttlStart = payload.includeTTL ? globalThis.performance.now() : undefined;
+    const ttlStart = payload.includeTTL ? perfNow() : undefined;
     const request = { ...payload, cacheOptions: this.#lruOptions } as ExecPayload;
     if (cluster.isPrimary) {
       this.#publishingOwnMutation = true;
       try {
         const r = dispatchAndBroadcast(this.namespace, request);
         this.#invalidateOwnEvictions(r);
-        return { ...r, value: r.value as T, ttlStart };
+        return { ...r, ttlStart } as LocalResponse<T>;
       } catch (e) {
         // Primary-mode errors always reject; failsafe only applies to IPC
         // timeouts in worker mode.
@@ -726,7 +706,17 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
       request,
     );
     this.#invalidateOwnEvictions(r);
-    if (r.version > 0) this.#emitLocalInvalidation(request, r.value, r.version);
+    if (r.version > 0 && shouldEmitLocalInvalidation(request, r.value)) {
+      const msg = buildInvalidation(this.namespace, request, r.version);
+      if (msg) {
+        this.#publishingOwnMutation = true;
+        try {
+          emitInvalidation(msg);
+        } finally {
+          this.#publishingOwnMutation = false;
+        }
+      }
+    }
     return { ...r, ttlStart };
   }
 }

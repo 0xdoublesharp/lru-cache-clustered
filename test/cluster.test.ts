@@ -466,6 +466,17 @@ void test('cluster: wrapped caches round-trip encoded Buffers across workers', {
       key: 'user:42',
     });
     assert.deepEqual(decoded, { id: 42, name: 'ada' });
+
+    const bufL1 = await workers[0].send<{
+      warmIsBuffer: boolean;
+      warmByte: number;
+      bypassIsBuffer: boolean;
+      bypassByte: number;
+    }>('probeBufferUpdateL1', {
+      options: { namespace, max: 10, localL1: { experimental: true, ttl: 5000 } },
+      key: 'buf:1',
+    });
+    assert.deepEqual(bufL1, { warmIsBuffer: true, warmByte: 17, bypassIsBuffer: true, bypassByte: 17 });
   } finally {
     await Promise.allSettled(workers.map((worker) => worker.stop()));
   }

@@ -1805,9 +1805,49 @@ void test(
       assert.equal(takeover, 'takeover-result');
       releaseHung();
       assert.equal(await hung, 'takeover-result');
+
+      // Cross-instance supersession must not stall withoutLocal().fetch() when L1 is disabled.
+      const sibling = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+      let releaseCross!: () => void;
+      let startedCross!: () => void;
+      const gateCross = new Promise<void>((resolve) => {
+        releaseCross = resolve;
+      });
+      const enterCross = new Promise<void>((resolve) => {
+        startedCross = resolve;
+      });
+      const slowCross = cache.fetch('cross', async () => {
+        startedCross();
+        await gateCross;
+        return 'stale-cross';
+      });
+      await enterCross;
+      await sibling.set('cross', 'fresh-cross');
+      assert.equal(await cache.withoutLocal().fetch('cross', () => 'unused'), 'fresh-cross');
+      releaseCross();
+      assert.equal(await slowCross, 'fresh-cross');
     } finally {
       releaseFirst();
       await cache.destroy();
     }
   },
 );
+
+void test('withoutLocal() preserves the bypass wrapper when chaining on/off/once', async () => {
+  const namespace = 'without-local-event-chaining';
+  const a = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000, invalidation: 'ttl-only' },
+  });
+  const b = new LRUCacheClustered<string, string>({ namespace, max: 10 });
+  try {
+    await a.set('k', 'old', { updateL1: true });
+    await b.set('k', 'fresh');
+    const fn = () => {};
+    const chained = a.withoutLocal().on('l1:hit', fn).once('l1:miss', fn).off('l1:hit', fn);
+    assert.equal(await chained.get('k'), 'fresh', 'event method chaining must keep withoutLocal() proxy');
+  } finally {
+    await a.destroy();
+  }
+});

@@ -135,6 +135,25 @@ async function handleCommand(cmd: string, args: unknown): Promise<unknown> {
       return wrapped.get(key);
     }
 
+    case 'probeBufferUpdateL1': {
+      const { options, key } = args as {
+        options: ConstructorParameters<typeof LRUCacheClustered>[0];
+        key: string;
+      };
+      const cache = await LRUCacheClustered.getInstance<string, Buffer>(options);
+      const buf = Buffer.from([17]);
+      await cache.set(key, buf, { updateL1: true });
+      buf[0] = 99;
+      const warm = await cache.get(key);
+      const bypass = await cache.withoutLocal().get(key);
+      return {
+        warmIsBuffer: Buffer.isBuffer(warm),
+        warmByte: warm?.readUInt8(0),
+        bypassIsBuffer: Buffer.isBuffer(bypass),
+        bypassByte: bypass?.readUInt8(0),
+      };
+    }
+
     case 'probeReadyConflict': {
       const { options } = args as {
         options: ConstructorParameters<typeof LRUCacheClustered>[0];
