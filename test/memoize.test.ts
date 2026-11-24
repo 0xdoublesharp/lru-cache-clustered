@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LRUCacheClustered } from '../src/index.ts';
+import { LRUCacheClustered, wrap } from '../src/index.ts';
 import { memoize } from '../src/memoize.ts';
 import { caches } from '../src/primary.ts';
 
@@ -228,4 +228,25 @@ void test('memoize honors L1 (second call hits L1 in primary mode)', async () =>
   await fn(3); // miss + fetcher
   await fn(3); // L1 hit
   assert.equal(calls, 1);
+});
+
+void test('memoize accepts a WrappedCache directly without casting', async () => {
+  const inner = new LRUCacheClustered<string, string>({ namespace: 'memo-wrapped', max: 10 });
+  const wrapped = wrap(inner, {
+    encode: (v: { doubled: number }) => JSON.stringify(v),
+    decode: (raw: string) => JSON.parse(raw) as { doubled: number },
+  });
+  let calls = 0;
+  const compute = memoize(
+    wrapped,
+    (n: number) => {
+      calls += 1;
+      return { doubled: n * 2 };
+    },
+    (n: number) => `w:${n}`,
+  );
+  assert.deepEqual(await compute(21), { doubled: 42 });
+  assert.deepEqual(await compute(21), { doubled: 42 });
+  assert.equal(calls, 1);
+  await wrapped.destroy();
 });

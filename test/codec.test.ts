@@ -318,3 +318,18 @@ void test('wrap() forwards read bypass options through L1-aware methods', async 
   assert.deepEqual(values.get('a'), { x: 1 });
   assert.equal(cache.localStats()?.hits, beforeMGet);
 });
+
+void test('wrap: values and entries handle undefined (failsafe=resolve timeout) without throwing', async () => {
+  const inner = new LRUCacheClustered<string, string>({ namespace: 'codec-timeout-enum', max: 10 });
+  const fakeTimeoutInner = Object.assign(Object.create(inner) as LRUCacheClustered<string, string>, {
+    values: async () => undefined as unknown as string[],
+    entries: async () => undefined as unknown as Array<[string, string]>,
+  });
+  const wrapped = wrap(fakeTimeoutInner, identityCodec);
+  assert.deepEqual(await wrapped.values(), []);
+  assert.deepEqual(await wrapped.entries(), []);
+  const yielded: Array<[string, string]> = [];
+  for await (const pair of wrapped) yielded.push(pair);
+  assert.deepEqual(yielded, []);
+  await inner.destroy();
+});

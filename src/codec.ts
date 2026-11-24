@@ -56,6 +56,7 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
 ): WrappedCache<K, V> {
   const enc = (v: V): U | Promise<U> => codec.encode(v);
   const dec = (u: U): V | Promise<V> => codec.decode(u);
+  const decOpt = async (u: U | undefined): Promise<V | undefined> => (u === undefined ? undefined : await dec(u));
 
   // Cast once to a `never`-valued surface for the public `cache` field. Users
   // who want to bypass the codec can drop in via `wrapped.cache as any` — we
@@ -69,8 +70,7 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
     ready: cache.ready,
 
     async get(key, opts) {
-      const raw = await cache.get(key, opts);
-      return raw === undefined ? undefined : await dec(raw);
+      return decOpt(await cache.get(key, opts));
     },
     async set(key, value, opts) {
       return cache.set(key, await enc(value), opts);
@@ -80,24 +80,21 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
     },
     has: (key, opts) => cache.has(key, opts),
     async peek(key, opts) {
-      const raw = await cache.peek(key, opts);
-      return raw === undefined ? undefined : await dec(raw);
+      return decOpt(await cache.peek(key, opts));
     },
     delete: (key) => cache.delete(key),
     getRemainingTTL: (key) => cache.getRemainingTTL(key),
 
     async mGet(keys, opts) {
-      const raw = await cache.mGet(keys, opts);
       const out = new Map<K, V | undefined>();
-      for (const [k, v] of raw) out.set(k, v === undefined ? undefined : await dec(v));
+      for (const [k, v] of await cache.mGet(keys, opts)) out.set(k, await decOpt(v));
       return out;
     },
     async mSet(entries, opts) {
       const encoded: Array<MSetEntry<K, U>> = [];
-      for (const entry of entries) {
-        const [k, v, entryOpts] = entry;
-        if (entryOpts === undefined) encoded.push([k, await enc(v)]);
-        else encoded.push([k, await enc(v), entryOpts]);
+      for (const [k, v, entryOpts] of entries) {
+        const ev = await enc(v);
+        encoded.push(entryOpts === undefined ? [k, ev] : [k, ev, entryOpts]);
       }
       return cache.mSet(encoded, opts);
     },
@@ -107,18 +104,18 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
     async values() {
       const raw = await cache.values();
       const out: V[] = [];
-      for (const v of raw) out.push(await dec(v));
+      for (const v of raw ?? []) out.push(await dec(v));
       return out;
     },
     async entries() {
       const raw = await cache.entries();
       const out: Array<[K, V]> = [];
-      for (const [k, v] of raw) out.push([k, await dec(v)]);
+      for (const [k, v] of raw ?? []) out.push([k, await dec(v)]);
       return out;
     },
     size: () => cache.size(),
     async *[Symbol.asyncIterator]() {
-      for (const [k, v] of await this.entries()) yield [k, v];
+      for (const pair of await this.entries()) yield pair;
     },
 
     clear: () => cache.clear(),
