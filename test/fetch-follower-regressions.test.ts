@@ -170,14 +170,26 @@ void test('worker exit preserves follower generation and last follower cleanup r
     };
   const leader = claim('leader', 9001);
   const follower = claim('follower', 9002);
+  const follower2 = claim('follower-2', 9003);
   assert.equal(follower.kind, 'follower');
+  assert.equal(follower2.kind, 'follower');
   cluster.emit('exit', { id: 9001 });
   const takeover = claim('follower', 9002, follower.generation);
   assert.equal(takeover.kind, 'leader');
   assert.notEqual(takeover.token, leader.token);
+  // Aborting takeover leaves follower-2 in the group until its cleanup releases the idle lock.
   dispatchOp(namespace, { op: 'fetchAbort', key: 'key', token: takeover.token });
   assert.equal(
     dispatchOp(namespace, { op: 'fetchRelease', key: 'key', generation: follower.generation, requestId: 'follower' }),
+    false,
+  );
+  assert.equal(
+    dispatchOp(namespace, {
+      op: 'fetchRelease',
+      key: 'key',
+      generation: follower2.generation,
+      requestId: 'follower-2',
+    }),
     true,
   );
   assert.throws(() => claim('follower', 9002, follower.generation), /superseded.*no current value/i);

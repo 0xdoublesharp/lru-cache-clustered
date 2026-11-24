@@ -366,3 +366,69 @@ void test('polling followers do not inflate primary miss stats on repeated poll 
     request(namespace, 'destroy');
   }
 });
+
+void test('promoting a follower to leader removes its follower registration so fetchAbort prunes the lock immediately', () => {
+  const namespace = 'primary-promoted-follower-prune';
+  const state = (globalThis as Record<PropertyKey, unknown>)[Symbol.for('lru-cache-clustered.primary')] as {
+    fetchLocks: Map<string, Map<unknown, { followers: Map<string, unknown> }>>;
+  };
+  try {
+    request(namespace, 'init', { options: { max: 10 } });
+    const l1 = request(namespace, 'fetchClaim', { key: 'k', requestId: 'req-1' });
+    assert.ok(l1.ok);
+    const f2 = request(namespace, 'fetchClaim', { key: 'k', requestId: 'req-2' });
+    assert.ok(f2.ok);
+    const generation = (f2.value as { generation: string }).generation;
+    assert.equal(request(namespace, 'fetchAbort', { key: 'k', token: (l1.value as { token: string }).token }).ok, true);
+
+    // Follower req-2 takes over as leader; it must no longer remain registered in followers.
+    const promoted = request(namespace, 'fetchClaim', { key: 'k', requestId: 'req-2', generation });
+    assert.ok(promoted.ok);
+    assert.equal((promoted.value as { kind: string }).kind, 'leader');
+    assert.equal(state.fetchLocks.get(namespace)?.get('k')?.followers.has('req-2'), false);
+
+    // Aborting the promoted leader with no other followers must immediately prune the lock.
+    assert.equal(
+      request(namespace, 'fetchAbort', { key: 'k', token: (promoted.value as { token: string }).token }).ok,
+      true,
+    );
+    assert.equal(state.fetchLocks.has(namespace), false, 'lock must be pruned immediately on abort');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('mGet validates all keys before mutating stats on invalid input', () => {
+  const namespace = 'primary-mget-atomic-validate';
+  try {
+    request(namespace, 'init', { options: { max: 10 } });
+    request(namespace, 'set', { key: 'a', value: 1 });
+    const resp = request(namespace, 'mGet', { keys: ['a', null] });
+    assert.equal(resp.ok, false);
+    if (!resp.ok) assert.match(resp.error.message, /cache key must not be null or undefined/);
+    const statsResp = request(namespace, 'stats');
+    assert.ok(statsResp.ok);
+    assert.equal((statsResp.value as { hits: number }).hits, 0, 'failed mGet must not mutate hit stats');
+    assert.equal((statsResp.value as { misses: number }).misses, 0, 'failed mGet must not mutate miss stats');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('incr and decr reject non-finite amount values instead of storing NaN/Infinity', () => {
+  const namespace = 'primary-incr-decr-finite-amount';
+  try {
+    request(namespace, 'init', { options: { max: 10 } });
+    request(namespace, 'set', { key: 'c', value: 5 });
+    for (const op of ['incr', 'decr'] as const) {
+      for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '2' as unknown as number]) {
+        const resp = request(namespace, op, { key: 'c', amount: bad });
+        assert.equal(resp.ok, false, `expected ${op} with amount=${String(bad)} to fail`);
+        if (!resp.ok) assert.match(resp.error.message, /invalid amount/i);
+      }
+    }
+    assert.equal((request(namespace, 'get', { key: 'c' }) as { value: unknown }).value, 5);
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
