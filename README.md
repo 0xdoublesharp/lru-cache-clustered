@@ -446,7 +446,7 @@ pnpm check
 
 When changing cache behavior, add a regression test that retains the same cache instances and checks the resulting values. For L1 changes, verify warm hits, invalidation, and expiration. Cluster tests use child processes under both JSON and advanced serialization.
 
-Dependency resolution waits seven days after publication through `minimumReleaseAge` in `pnpm-workspace.yaml`. Use frozen lockfile installs for reproducible checks. The [dependency update notes](./docs/dependency-updates.md) describe security overrides and the import-plugin compatibility patch.
+Dependency resolution waits seven days after publication through `minimumReleaseAge` in `pnpm-workspace.yaml`. Use frozen lockfile installs for reproducible checks. The [dependency update notes](./docs/dependency-updates.md) record security overrides and dependency update history.
 
 Release preparation with `pnpm prepare:publish` creates scoped and legacy package directories under `dist-publish/`. Pushing a `vX.Y.Z` tag matching the version in `package.json` triggers the [publishing workflow](./.github/workflows/npm-publish.yml), which runs the package checks and publishes both names to npm with provenance through GitHub OIDC.
 

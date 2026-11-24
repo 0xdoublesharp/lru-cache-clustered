@@ -1,3 +1,36 @@
+# Dependency update, November 23, 2026
+
+Updated `packageManager` to `pnpm@12.21.0` (the latest pnpm 12 release meeting the seven-day waiting policy) and updated 13 direct development dependencies to their latest compatible releases published at least seven days prior. The Node.js 22 runtime minimum, runtime dependencies (`debug`), and peer dependency (`lru-cache@^11`) remain unchanged.
+
+| Package / tool                     | Previous | Updated |
+| ---------------------------------- | -------- | ------- |
+| `pnpm` (`packageManager`)          | 10.33.2  | 12.21.0 |
+| `@size-limit/file`                 | 12.1.0   | 14.3.0  |
+| `@types/node`                      | 25.9.9   | 26.6.6  |
+| `@typescript-eslint/eslint-plugin` | 8.72.1   | 8.73.0  |
+| `@typescript-eslint/parser`        | 8.72.1   | 8.73.0  |
+| `c8`                               | 11.0.0   | 12.0.0  |
+| `eslint`                           | 10.14.0  | 10.15.0 |
+| `eslint-plugin-import-x`           | 4.17.1   | 4.18.1  |
+| `knip`                             | 6.44.1   | 6.45.1  |
+| `lint-staged`                      | 16.4.0   | 17.6.1  |
+| `prettier`                         | 3.9.10   | 3.10.1  |
+| `size-limit`                       | 12.1.0   | 14.3.0  |
+| `tsup`                             | 8.5.1    | 9.0.0   |
+| `type-coverage`                    | 2.31.1   | 2.31.2  |
+
+Configuration and override changes:
+
+- Migrated `onlyBuiltDependencies` from `package.json` to `allowBuilds` in `pnpm-workspace.yaml` for pnpm 12.
+- Removed the `tsup>esbuild` override because `tsup@9.0.0` depends on `esbuild@^0.28.2` directly.
+- Removed `patchedDependencies` and `patches/eslint-plugin-import-x@4.17.1.patch` now that `eslint-plugin-import-x@4.18.1` includes upstream minimatch 11 support and meets the seven-day cutoff.
+- Refreshed the `glob` and `minimatch` security overrides to `14.0.6` and `11.0.9`.
+- Kept `typescript` on `^6.0.3`: `typescript@7.0.2` ships native binaries without a JavaScript compiler API (`main: undefined`), while `@typescript-eslint@8.73.0` (`>=4.8.4 <6.1.0`) and `type-coverage@2.31.2` still require the TypeScript 6 compiler API.
+
+All 487 lockfile entries passed pnpm 12's supply-chain policy check (`minimumReleaseAge: 10080`), and `pnpm audit` reported zero known vulnerabilities. Newer releases inside the seven-day window (`pnpm@12.23.0`, `@typescript-eslint/*@8.74.0`, `knip@6.48.0`, `lint-staged@17.6.2`) were excluded by the policy.
+
+---
+
 # Dependency update, November 8, 2026
 
 Included in [v2.1.3](../CHANGELOG.md#213--2026-11-08).
