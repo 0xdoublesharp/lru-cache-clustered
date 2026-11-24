@@ -152,18 +152,81 @@ theorem natToDecChars_injective {m n : Nat}
   rw [h] at h1
   omega
 
-/-- Full typed key model for `encodeL1Key` (`src/l1.ts`), including WeakMap `Nat` IDs
-    and `Bool` values. -/
+private theorem digitChar_ne_minus (d : Nat) : digitChar d ≠ '-' := by
+  match d with
+  | 0 => decide
+  | 1 => decide
+  | 2 => decide
+  | 3 => decide
+  | 4 => decide
+  | 5 => decide
+  | 6 => decide
+  | 7 => decide
+  | 8 => decide
+  | _ + 9 => simp [digitChar]
+
+private theorem natToDecChars_head_ne_minus (n : Nat) :
+    ∀ cs, natToDecChars n ≠ '-' :: cs := by
+  induction n using Nat.strongRecOn with
+  | ind n ih =>
+    intro cs h
+    rw [natToDecChars] at h
+    by_cases hlt : n < 10
+    · simp only [hlt, ↓reduceDIte] at h
+      have hhead : digitChar n = '-' := by injection h
+      exact digitChar_ne_minus n hhead
+    · simp only [hlt, ↓reduceDIte] at h
+      cases hq : natToDecChars (n / 10) with
+      | nil =>
+        rw [hq, List.nil_append] at h
+        have hhead : digitChar (n % 10) = '-' := by injection h
+        exact digitChar_ne_minus (n % 10) hhead
+      | cons c rest =>
+        rw [hq, List.cons_append] at h
+        injection h with hc _
+        subst hc
+        exact ih (n / 10) (Nat.div_lt_self (by omega) (by omega)) rest hq
+
+/-- Signed decimal encoding matching JavaScript `BigInt.prototype.toString()` (`src/l1.ts`). -/
+def intToDecChars : Int → List Char
+  | Int.ofNat n => natToDecChars n
+  | Int.negSucc n => '-' :: natToDecChars (n + 1)
+
+theorem intToDecChars_injective {a b : Int}
+    (h : intToDecChars a = intToDecChars b) : a = b := by
+  cases a with
+  | ofNat m =>
+    cases b with
+    | ofNat n =>
+      exact congrArg Int.ofNat (natToDecChars_injective h)
+    | negSucc n =>
+      exact False.elim (natToDecChars_head_ne_minus m _ h)
+  | negSucc m =>
+    cases b with
+    | ofNat n =>
+      exact False.elim (natToDecChars_head_ne_minus n _ h.symm)
+    | negSucc n =>
+      simp only [intToDecChars] at h
+      injection h with _ hrest
+      have hsucc := natToDecChars_injective hrest
+      exact congrArg Int.negSucc (Nat.succ.inj hsucc)
+
+/-- Full typed key model for `encodeL1Key` (`src/l1.ts`), covering strings, booleans,
+    signed `Int` bigints, WeakMap `Nat` function/object IDs, and canonical number payloads. -/
 inductive L1Key where
   | str (s : String)
+  | num (canonical : String)
   | bool (b : Bool)
+  | bigint (i : Int)
   | fn (id : Nat)
   | obj (id : Nat)
   deriving Repr, DecidableEq
 
 def encodeL1Key : L1Key → String
   | .str s => encodeTaggedKey ⟨.str, s⟩
+  | .num s => encodeTaggedKey ⟨.num, s⟩
   | .bool b => encodeTaggedKey ⟨.bool, if b then "true" else "false"⟩
+  | .bigint i => encodeTaggedKey ⟨.bigint, String.ofList (intToDecChars i)⟩
   | .fn id => encodeTaggedKey ⟨.fn, String.ofList (natToDecChars id)⟩
   | .obj id => encodeTaggedKey ⟨.obj, String.ofList (natToDecChars id)⟩
 
@@ -172,16 +235,26 @@ theorem encodeL1Key_injective {k1 k2 : L1Key}
   cases k1 <;> cases k2 <;> simp only [encodeL1Key] at h
   · have ht := encodeTaggedKey_injective h
     injection ht with _ hs
-    subst hs; rfl
+    rw [hs]
   all_goals
     try (
       have ht := encodeTaggedKey_injective h
       cases ht
     )
+  · have ht := encodeTaggedKey_injective h
+    injection ht with _ hs
+    rw [hs]
   · rename_i b1 b2
     have ht := encodeTaggedKey_injective h
     injection ht with _ hs
     cases b1 <;> cases b2 <;> simp at hs ⊢
+  · rename_i i1 i2
+    have ht := encodeTaggedKey_injective h
+    injection ht with _ hs
+    have hlist : (String.ofList (intToDecChars i1)).toList = (String.ofList (intToDecChars i2)).toList :=
+      congrArg String.toList hs
+    simp only [String.toList_ofList] at hlist
+    rw [intToDecChars_injective hlist]
   · rename_i id1 id2
     have ht := encodeTaggedKey_injective h
     injection ht with _ hs
