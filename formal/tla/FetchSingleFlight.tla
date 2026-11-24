@@ -17,6 +17,7 @@ VARIABLES
   lockOwner,       \* Callers \cup {NONE}: ownerRequestId of active leader
   lockFollowers,   \* SUBSET Callers: registered follower request IDs
   lockExpired,     \* BOOLEAN: whether 30s fetch lease has expired
+  lockResolvedVal, \* Vals \cup {NONE}: unadmitted (oversize) result held for active followers
   nextTok,         \* 0..MaxTokens: monotonic primaryState.nextFetchToken
   cState,          \* [Callers -> {"idle", "claimPending", "leader", "follower",
                    \*              "doneVal", "doneSuperseded", "doneFailed"}]
@@ -26,7 +27,7 @@ VARIABLES
   cVal             \* [Callers -> Vals \cup {NONE}]: resolved value (when doneVal)
 
 vars == <<nsExists, cacheVal, lockPresent, lockHasToken, lockToken, lockGen,
-          lockOwner, lockFollowers, lockExpired, nextTok,
+          lockOwner, lockFollowers, lockExpired, lockResolvedVal, nextTok,
           cState, cTok, cGen, cForce, cVal>>
 
 ClearLock ==
@@ -37,6 +38,7 @@ ClearLock ==
   /\ lockOwner' = NONE
   /\ lockFollowers' = {}
   /\ lockExpired' = FALSE
+  /\ lockResolvedVal' = NONE
 
 Init ==
   /\ nsExists = TRUE
@@ -48,6 +50,7 @@ Init ==
   /\ lockOwner = NONE
   /\ lockFollowers = {}
   /\ lockExpired = FALSE
+  /\ lockResolvedVal = NONE
   /\ nextTok = 0
   /\ cState = [c \in Callers |-> "idle"]
   /\ cTok = [c \in Callers |-> 0]
@@ -61,7 +64,8 @@ StartFetch(c, force) ==
   /\ cState' = [cState EXCEPT ![c] = "claimPending"]
   /\ cForce' = [cForce EXCEPT ![c] = force]
   /\ UNCHANGED <<nsExists, cacheVal, lockPresent, lockHasToken, lockToken, lockGen,
-                 lockOwner, lockFollowers, lockExpired, nextTok, cTok, cGen, cVal>>
+                 lockOwner, lockFollowers, lockExpired, lockResolvedVal, nextTok,
+                 cTok, cGen, cVal>>
 
 \* Primary executes dispatchOp(..., 'fetchClaim') for an initial or polling caller
 ProcessClaim(c) ==
@@ -75,19 +79,23 @@ ProcessClaim(c) ==
                /\ UNCHANGED cVal
        /\ cGen' = [cGen EXCEPT ![c] = 0]
        /\ UNCHANGED <<nsExists, cacheVal, lockPresent, lockHasToken, lockToken, lockGen,
-                      lockOwner, lockFollowers, lockExpired, nextTok, cTok, cForce>>
+                      lockOwner, lockFollowers, lockExpired, lockResolvedVal, nextTok,
+                      cTok, cForce>>
      ELSE \* Initial claim or matching active generation
-       /\ IF ~cForce[c] /\ cacheVal /= NONE
-          THEN \* Cache hit: unregister follower and clean up idle lock
+       /\ LET val == IF cacheVal /= NONE THEN cacheVal
+                     ELSE IF lockPresent THEN lockResolvedVal ELSE NONE
+          IN IF ~cForce[c] /\ val /= NONE
+          THEN \* Cache hit (or unadmitted oversize resolvedValue): unregister follower and prune idle lock
             LET remFollowers == lockFollowers \ {c}
                 removeLock == lockPresent /\ ~lockHasToken /\ remFollowers = {}
             IN /\ nsExists' = TRUE
                /\ IF removeLock
                   THEN ClearLock
                   ELSE /\ lockFollowers' = remFollowers
-                       /\ UNCHANGED <<lockPresent, lockHasToken, lockToken, lockGen, lockOwner, lockExpired>>
+                       /\ UNCHANGED <<lockPresent, lockHasToken, lockToken, lockGen,
+                                      lockOwner, lockExpired, lockResolvedVal>>
                /\ cState' = [cState EXCEPT ![c] = "doneVal"]
-               /\ cVal' = [cVal EXCEPT ![c] = cacheVal]
+               /\ cVal' = [cVal EXCEPT ![c] = val]
                /\ cGen' = [cGen EXCEPT ![c] = 0]
                /\ UNCHANGED <<cacheVal, nextTok, cTok, cForce>>
           ELSE IF ~cForce[c] /\ lockPresent /\ lockHasToken /\ ~lockExpired
@@ -98,7 +106,7 @@ ProcessClaim(c) ==
             /\ cGen' = [cGen EXCEPT ![c] = lockGen]
             /\ cForce' = [cForce EXCEPT ![c] = FALSE]
             /\ UNCHANGED <<cacheVal, lockPresent, lockHasToken, lockToken, lockGen,
-                           lockOwner, lockExpired, nextTok, cTok, cVal>>
+                           lockOwner, lockExpired, lockResolvedVal, nextTok, cTok, cVal>>
           ELSE \* Grant leadership (fresh miss, forceRefresh, aborted leader, or expired lease)
             /\ nextTok < MaxTokens
             /\ LET tok == nextTok + 1
@@ -112,19 +120,28 @@ ProcessClaim(c) ==
                   /\ lockOwner' = c
                   /\ lockFollowers' = lockFollowers \ {c}
                   /\ lockExpired' = FALSE
+                  /\ lockResolvedVal' = NONE
                   /\ cState' = [cState EXCEPT ![c] = "leader"]
                   /\ cTok' = [cTok EXCEPT ![c] = tok]
                   /\ cForce' = [cForce EXCEPT ![c] = FALSE]
                   /\ UNCHANGED <<cacheVal, cGen, cVal>>
 
-\* Leader completes fetcher and executes fetchStore (plus existingOnly fallback on supersede)
-LeaderStore(c, v) ==
+\* Leader completes fetcher and executes fetchStore (admitted = TRUE, or FALSE for oversize)
+LeaderStore(c, v, admitted) ==
   /\ cState[c] = "leader"
   /\ IF lockPresent /\ lockHasToken /\ lockToken = cTok[c]
-     THEN \* Token matches: store value and delete entire fetch group
+     THEN \* Token matches: store value (or deliver to followers if oversize)
        /\ nsExists' = TRUE
-       /\ cacheVal' = v
-       /\ ClearLock
+       /\ IF admitted
+          THEN /\ cacheVal' = v
+               /\ ClearLock
+          ELSE /\ cacheVal' = NONE
+               /\ IF lockFollowers = {}
+                  THEN ClearLock
+                  ELSE /\ lockHasToken' = FALSE
+                       /\ lockOwner' = NONE
+                       /\ lockResolvedVal' = v
+                       /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockFollowers, lockExpired>>
        /\ cState' = [cState EXCEPT ![c] = "doneVal"]
        /\ cVal' = [cVal EXCEPT ![c] = v]
        /\ cTok' = [cTok EXCEPT ![c] = 0]
@@ -139,7 +156,8 @@ LeaderStore(c, v) ==
           IN /\ IF removeLock
                 THEN ClearLock
                 ELSE /\ lockFollowers' = remFollowers
-                     /\ UNCHANGED <<lockPresent, lockHasToken, lockToken, lockGen, lockOwner, lockExpired>>
+                     /\ UNCHANGED <<lockPresent, lockHasToken, lockToken, lockGen,
+                                    lockOwner, lockExpired, lockResolvedVal>>
        /\ IF nsExists /\ cacheVal /= NONE
           THEN /\ cState' = [cState EXCEPT ![c] = "doneVal"]
                /\ cVal' = [cVal EXCEPT ![c] = cacheVal]
@@ -164,7 +182,7 @@ LeaderAbort(c) ==
            ELSE /\ lockHasToken' = newHasTok
                 /\ lockOwner' = newOwner
                 /\ lockFollowers' = remFollowers
-                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired>>
+                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired, lockResolvedVal>>
         /\ cState' = [cState EXCEPT ![c] = "doneFailed"]
         /\ cTok' = [cTok EXCEPT ![c] = 0]
         /\ cGen' = [cGen EXCEPT ![c] = 0]
@@ -185,7 +203,7 @@ TimeoutAndRelease(c) ==
            ELSE /\ lockHasToken' = newHasTok
                 /\ lockOwner' = newOwner
                 /\ lockFollowers' = remFollowers
-                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired>>
+                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired, lockResolvedVal>>
         /\ cState' = [cState EXCEPT ![c] = "doneFailed"]
         /\ cTok' = [cTok EXCEPT ![c] = 0]
         /\ cGen' = [cGen EXCEPT ![c] = 0]
@@ -204,7 +222,7 @@ WorkerExit(c) ==
            ELSE /\ lockHasToken' = newHasTok
                 /\ lockOwner' = newOwner
                 /\ lockFollowers' = remFollowers
-                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired>>
+                /\ UNCHANGED <<lockPresent, lockToken, lockGen, lockExpired, lockResolvedVal>>
         /\ cState' = [cState EXCEPT ![c] = "doneFailed"]
         /\ cTok' = [cTok EXCEPT ![c] = 0]
         /\ cGen' = [cGen EXCEPT ![c] = 0]
@@ -217,7 +235,7 @@ LeaseExpire ==
   /\ ~lockExpired
   /\ lockExpired' = TRUE
   /\ UNCHANGED <<nsExists, cacheVal, lockPresent, lockHasToken, lockToken, lockGen,
-                 lockOwner, lockFollowers, nextTok, cState, cTok, cGen, cForce, cVal>>
+                 lockOwner, lockFollowers, lockResolvedVal, nextTok, cState, cTok, cGen, cForce, cVal>>
 
 \* Explicit mutations supersede the active fetch lock
 ExplicitSet(v) ==
@@ -242,7 +260,7 @@ ExplicitDestroy ==
 Next ==
   \/ \E c \in Callers, f \in BOOLEAN : StartFetch(c, f)
   \/ \E c \in Callers : ProcessClaim(c)
-  \/ \E c \in Callers, v \in Vals : LeaderStore(c, v)
+  \/ \E c \in Callers, v \in Vals, adm \in BOOLEAN : LeaderStore(c, v, adm)
   \/ \E c \in Callers : LeaderAbort(c)
   \/ \E c \in Callers : TimeoutAndRelease(c)
   \/ \E c \in Callers : WorkerExit(c)
@@ -265,6 +283,7 @@ TypeOK ==
   /\ lockOwner \in Callers \cup {NONE}
   /\ lockFollowers \subseteq Callers
   /\ lockExpired \in BOOLEAN
+  /\ lockResolvedVal \in Vals \cup {NONE}
   /\ nextTok \in 0..MaxTokens
   /\ cState \in [Callers -> {"idle", "claimPending", "leader", "follower",
                              "doneVal", "doneSuperseded", "doneFailed"}]
@@ -292,7 +311,7 @@ LockOwnerConsistent ==
 
 \* A destroyed namespace never has a cached value or an active fetch lock.
 DestroyedNamespaceClean ==
-  ~nsExists => (cacheVal = NONE /\ ~lockPresent)
+  ~nsExists => (cacheVal = NONE /\ ~lockPresent /\ lockResolvedVal = NONE)
 
 \* When every caller has settled (idle / done*), no orphaned fetch lock remains.
 NoOrphanedLockWhenSettled ==
@@ -306,5 +325,9 @@ NoEmptyLock ==
 \* An active leader is never simultaneously registered in its own follower set.
 LeaderNotInFollowers ==
   (lockPresent /\ lockHasToken) => lockOwner \notin lockFollowers
+
+\* An unadmitted oversize resolvedValue only exists on an unowned lock with waiting followers.
+ResolvedValueOnlyWhenUnowned ==
+  lockResolvedVal /= NONE => (lockPresent /\ ~lockHasToken /\ lockFollowers /= {})
 
 =============================================================================

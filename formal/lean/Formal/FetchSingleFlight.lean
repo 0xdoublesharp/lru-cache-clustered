@@ -1,18 +1,19 @@
 namespace LruCacheClustered.Fetch
 
 /-- Primary-side single-flight lock (`FetchLock` in `src/primary.ts`). -/
-structure FetchLock where
+structure FetchLock (V : Type) where
   token : Option Nat
   generation : Nat
   ownerRequestId : Option Nat
   followers : List Nat
+  resolvedValue : Option V := none
   deriving Repr, DecidableEq
 
 /-- Primary namespace slice for a single key's fetch coordination. -/
 structure NamespaceState (V : Type) where
   existsNs : Bool
   cached : Option V
-  lock : Option FetchLock
+  lock : Option (FetchLock V)
   nextToken : Nat
   deriving Repr, DecidableEq
 
@@ -36,12 +37,24 @@ def applyDelete {V : Type} (s : NamespaceState V) : NamespaceState V :=
 def applyDestroy {V : Type} (s : NamespaceState V) : NamespaceState V :=
   { s with existsNs := false, cached := none, lock := none }
 
-/-- `dispatchOp(..., 'fetchStore')` (`src/primary.ts`). -/
-def fetchStore {V : Type} (s : NamespaceState V) (tok : Nat) (v : V) : Bool × NamespaceState V :=
+/-- `dispatchOp(..., 'fetchStore')` (`src/primary.ts`). When `admitted = false`
+    (oversize entry) and followers are waiting, the value is preserved in
+    `lock.resolvedValue` until the followers drain. -/
+def fetchStore {V : Type} (s : NamespaceState V) (tok : Nat) (v : V) (admitted : Bool := true) :
+    Bool × NamespaceState V :=
   match s.lock with
   | some lk =>
     if lk.token == some tok then
-      (true, { s with existsNs := true, cached := some v, lock := none })
+      if admitted then
+        (true, { s with existsNs := true, cached := some v, lock := none })
+      else if lk.followers.isEmpty then
+        (true, { s with existsNs := true, cached := none, lock := none })
+      else
+        (true, { s with
+          existsNs := true,
+          cached := none,
+          lock := some { lk with token := none, ownerRequestId := none, resolvedValue := some v }
+        })
     else
       (false, s)
   | none => (false, s)
@@ -95,7 +108,10 @@ def fetchClaim {V : Type} (s : NamespaceState V) (reqId : Nat) (gen : Option Nat
   else
     let sNs := { s with existsNs := true }
     if !forceRefresh then
-      match sNs.cached with
+      let available := match sNs.cached with
+        | some v => some v
+        | none => sNs.lock.bind (·.resolvedValue)
+      match available with
       | some v =>
         let nextLock := match sNs.lock with
           | none => none
@@ -113,12 +129,12 @@ def fetchClaim {V : Type} (s : NamespaceState V) (reqId : Nat) (gen : Option Nat
           else
             let tok := sNs.nextToken + 1
             let remFollowers := lk.followers.filter (· != reqId)
-            let newLk : FetchLock :=
+            let newLk : FetchLock V :=
               { token := some tok, generation := lk.generation, ownerRequestId := some reqId, followers := remFollowers }
             (ClaimOutcome.leader tok, { sNs with lock := some newLk, nextToken := tok })
         | none =>
           let tok := sNs.nextToken + 1
-          let newLk : FetchLock :=
+          let newLk : FetchLock V :=
             { token := some tok, generation := tok, ownerRequestId := some reqId, followers := [] }
           (ClaimOutcome.leader tok, { sNs with lock := some newLk, nextToken := tok })
     else
@@ -126,7 +142,7 @@ def fetchClaim {V : Type} (s : NamespaceState V) (reqId : Nat) (gen : Option Nat
       let (newGen, newFollowers) := match sNs.lock with
         | some lk => (lk.generation, lk.followers.filter (· != reqId))
         | none => (tok, [])
-      let newLk : FetchLock :=
+      let newLk : FetchLock V :=
         { token := some tok, generation := newGen, ownerRequestId := some reqId, followers := newFollowers }
       (ClaimOutcome.leader tok, { sNs with lock := some newLk, nextToken := tok })
 
@@ -148,9 +164,9 @@ theorem fetchStore_after_destroy_does_not_recreate {V : Type}
   rfl
 
 theorem fetchStore_mismatched_token_no_mutation {V : Type}
-    (s : NamespaceState V) (lk : FetchLock) (tok : Nat) (v : V)
+    (s : NamespaceState V) (lk : FetchLock V) (tok : Nat) (v : V) (admitted : Bool)
     (hlk : s.lock = some lk) (hne : lk.token ≠ some tok) :
-    fetchStore s tok v = (false, s) := by
+    fetchStore s tok v admitted = (false, s) := by
   have hbeq : (lk.token == some tok) = false := beq_false_of_ne hne
   simp [fetchStore, hlk, hbeq]
 
@@ -199,5 +215,17 @@ theorem promoted_follower_abort_prunes_lock {V : Type}
       aborted = true ∧ sAborted.lock = none
     | _ => False := by
   simp [fetchClaim, fetchAbort, hMiss, hLock]
+
+/-- When an oversize `fetchStore` (`admitted = false`) finishes with a waiting follower,
+    that follower receives the computed value on its next poll and the lock prunes cleanly. -/
+theorem oversize_fetchStore_delivers_to_follower_and_prunes {V : Type}
+    (s : NamespaceState V) (tok gen leaderReq followerReq : Nat) (v : V)
+    (hLock : s.lock = some {
+      token := some tok, generation := gen, ownerRequestId := some leaderReq, followers := [followerReq]
+    }) :
+    let (ok, sStored) := fetchStore s tok v false
+    let (outcome, sFinal) := fetchClaim sStored followerReq (some gen) false true
+    ok = true ∧ outcome = ClaimOutcome.value v ∧ sFinal.cached = none ∧ sFinal.lock = none := by
+  simp [fetchStore, fetchClaim, hLock]
 
 end LruCacheClustered.Fetch
