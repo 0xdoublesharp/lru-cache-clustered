@@ -129,8 +129,46 @@ async function exerciseFailedFollowerCleanup() {
   return { namespace, generation };
 }
 
+async function exerciseWorkerInitL1SubscriptionCleanup() {
+  const localSubs = (globalThis as Record<PropertyKey, unknown>)[
+    Symbol.for('lru-cache-clustered.invalidations')
+  ] as Map<string, Set<unknown>>;
+
+  // Case 1: destroy() called before constructor's async init completes must not leave a leaked subscription.
+  const nsImmediate = 'coverage-worker-destroy-before-init';
+  const eager = new LRUCacheClustered<string, string>({
+    namespace: nsImmediate,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  await eager.destroy();
+  await eager.ready;
+  assert.equal(localSubs.get(nsImmediate)?.size ?? 0, 0, 'destroy before init must not leak L1 subscription');
+
+  // Case 2: failed getInstance() with conflicting options must clean up its L1 subscription.
+  const nsConflict = 'coverage-worker-failed-init-l1';
+  const owner = await LRUCacheClustered.getInstance<string, string>({
+    namespace: nsConflict,
+    max: 10,
+  });
+  try {
+    await assert.rejects(
+      LRUCacheClustered.getInstance<string, string>({
+        namespace: nsConflict,
+        max: 20,
+        localL1: { experimental: true, ttl: 5000 },
+      }),
+      /Conflicting options/,
+    );
+    assert.equal(localSubs.get(nsConflict)?.size ?? 0, 0, 'failed init must not leak L1 subscription');
+  } finally {
+    await owner.destroy();
+  }
+}
+
 try {
   await exerciseSiblingInvalidations();
+  await exerciseWorkerInitL1SubscriptionCleanup();
   const cleanup = await exerciseFailedFollowerCleanup();
   process.send?.({ kind: 'result', cleanup }, () => process.disconnect?.());
 } catch (error) {

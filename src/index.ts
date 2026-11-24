@@ -157,14 +157,10 @@ function normalizeL1(
   const requestedTtl = opts.ttl ?? Math.max(100, Math.min(primaryTtl * 0.1, DEFAULT_L1_TTL_MS));
   const ttl = Math.max(1, Math.floor(Math.min(requestedTtl, primaryTtl)));
 
-  const methods =
-    opts.methods === undefined
-      ? { get: true, has: true, fetch: true }
-      : {
-          get: opts.methods.get === true,
-          has: opts.methods.has === true,
-          fetch: opts.methods.fetch === true,
-        };
+  const m = opts.methods;
+  const methods = m
+    ? { get: m.get === true, has: m.has === true, fetch: m.fetch === true }
+    : { get: true, has: true, fetch: true };
 
   return {
     max: opts.max ?? DEFAULT_L1_MAX,
@@ -213,6 +209,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
   readonly #l1Invalidation: 'broadcast' | 'ttl-only';
   #unsubscribeL1?: () => void;
   #publishingOwnMutation = false;
+  #destroyed = false;
 
   constructor(options: LRUCacheClusterOptions & InternalOptions = {}) {
     this.namespace = options.namespace ?? 'default';
@@ -246,14 +243,10 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
       getOrCreateCache(this.namespace, this.#lruOptions);
       this.#l1?.advanceLatestSeen(getNamespaceVersion(this.namespace));
       this.#installL1Subscription();
-      this.ready = Promise.resolve(undefined);
-    } else if (!options.noInit) {
-      // Swallow rejection so consumers can `await cache.ready` purely for
-      // ordering without unhandled-rejection noise.
-      this.ready = this.#initWorker().catch(() => undefined);
-    } else {
-      this.ready = Promise.resolve(undefined);
     }
+    // Swallow rejection so consumers can `await cache.ready` purely for
+    // ordering without unhandled-rejection noise.
+    this.ready = !cluster.isPrimary && !options.noInit ? this.#initWorker().catch(() => undefined) : Promise.resolve();
   }
 
   // eslint-disable-next-line @typescript-eslint/no-empty-object-type
@@ -435,6 +428,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     return this.#dispatch<void>({ op: 'load', entries });
   }
   destroy(): Promise<boolean> {
+    this.#destroyed = true;
     this.#inFlight.clear();
     this.#unsubscribeL1?.();
     this.#unsubscribeL1 = undefined;
@@ -442,7 +436,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     return this.#dispatch<boolean>({ op: 'destroy' });
   }
   healthCheck() {
-    return this.#dispatchRequired<void>({ op: 'healthCheck' });
+    return this.#dispatch<void>({ op: 'healthCheck' }, 'reject');
   }
   stats() {
     return this.#dispatch<Stats>({ op: 'stats' });
@@ -576,7 +570,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
               'reject',
             );
             if (!stored.value) {
-              const newer = await this.#dispatchRequired<V | undefined>({ op: 'get', key, existingOnly: true });
+              const newer = await this.#dispatch<V | undefined>({ op: 'get', key, existingOnly: true }, 'reject');
               if (newer === undefined)
                 throw new Error('Fetch was superseded by a cache mutation and no current value remains');
               return newer;
@@ -586,16 +580,15 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
             // returned by fetchStore. bypassL1 skips the populate so the caller
             // sees the fresh L2 result without repopulating their L1.
             if (useFetchL1) {
+              this.#deleteLocal(key, stored.version);
               this.#setLocalFromPrimary(key, v, stored, 0, read);
+            } else {
+              this.#deleteLocal(key);
             }
             return v;
           } catch (error) {
             try {
-              await this.#dispatchRequired<boolean>({
-                op: 'fetchAbort',
-                key,
-                token: claim.token,
-              });
+              await this.#dispatch<boolean>({ op: 'fetchAbort', key, token: claim.token }, 'reject');
             } catch {
               // Ignore cleanup failures and preserve the fetcher's error.
             }
@@ -620,7 +613,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
       read?.release();
       if (generation !== undefined || claimPending) {
         try {
-          await this.#dispatchRequired<boolean>({ op: 'fetchRelease', key, generation, requestId });
+          await this.#dispatch<boolean>({ op: 'fetchRelease', key, generation, requestId }, 'reject');
         } catch {
           // Cleanup must preserve the original result or fetcher error.
         }
@@ -641,7 +634,7 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
   async #initWorker(): Promise<void> {
     const r = await this.#dispatchWithMeta<{ version: number }>({ op: 'init', options: this.#lruOptions }, 'reject');
     this.#l1?.advanceLatestSeen(r.value.version);
-    this.#installL1Subscription();
+    if (!this.#destroyed) this.#installL1Subscription();
   }
 
   async #readLocal(op: 'get' | 'peek', key: K, opts?: ReadOptions): Promise<V | undefined> {
@@ -686,15 +679,8 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
       }
     } finally {
       // Event handlers may throw. They must not prevent coherence updates.
-      if (msg.push === 'l1:invalidate') {
-        try {
-          this.#l1!.delete(encodeL1Key(msg.key as NonNullish), msg.key, false, msg.version);
-        } catch {
-          // Symbol or unencodable key: no-op
-        }
-      } else {
-        this.#l1!.clear(false, msg.version);
-      }
+      if (msg.push === 'l1:invalidate') this.#deleteLocal(msg.key as K, msg.version);
+      else this.#l1!.clear(false, msg.version);
     }
   }
 
@@ -718,10 +704,10 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
     return enc === undefined ? undefined : this.#l1!.get(enc, key, mode);
   }
 
-  #deleteLocal(key: K): void {
+  #deleteLocal(key: K, version?: number): void {
     if (!this.#l1) return;
     const enc = encodeL1KeyOrUndefined(key);
-    if (enc !== undefined) this.#l1.delete(enc, key);
+    if (enc !== undefined) this.#l1.delete(enc, key, version === undefined, version);
   }
 
   #emitLocalInvalidation(payload: ExecPayload, value: unknown, version: number): void {
@@ -737,28 +723,20 @@ export class LRUCacheClustered<K extends {} = string, V extends {} = {}> {
   }
 
   #invalidateOwnEvictions(result: DispatchResult<unknown>): void {
-    if (!this.#l1) return;
-    for (const key of result.evictedKeys ?? []) {
-      try {
-        this.#l1.delete(encodeL1Key(key as NonNullish), key, false, result.version);
-      } catch {
-        // An unencodable key cannot have populated this L1.
-      }
-    }
+    for (const key of result.evictedKeys ?? []) this.#deleteLocal(key as K, result.version);
   }
 
-  #dispatch<T>(payload: ExecPayload): Promise<T> {
-    return this.#dispatchWithMeta<T>(payload, this.failsafe).then((r) => r.value);
-  }
-
-  #dispatchRequired<T>(payload: ExecPayload): Promise<T> {
-    return this.#dispatchWithMeta<T>(payload, 'reject').then((r) => r.value);
+  #dispatch<T>(payload: ExecPayload, failsafe = this.failsafe): Promise<T> {
+    return this.#dispatchWithMeta<T>(payload, failsafe).then((r) => r.value);
   }
 
   async #dispatchWithMeta<T>(payload: ExecPayload, failsafe: 'resolve' | 'reject'): Promise<LocalResponse<T>> {
     // destroy() releases subscriptions. Reusing the instance must restore
     // invalidation delivery before another read can warm its local cache.
-    if (payload.op !== 'destroy' && payload.op !== 'init') this.#installL1Subscription();
+    if (payload.op !== 'destroy' && payload.op !== 'init') {
+      this.#destroyed = false;
+      this.#installL1Subscription();
+    }
     const ttlStart = payload.includeTTL ? globalThis.performance.now() : undefined;
     const request = { ...payload, cacheOptions: this.#lruOptions } as ExecPayload;
     if (cluster.isPrimary) {

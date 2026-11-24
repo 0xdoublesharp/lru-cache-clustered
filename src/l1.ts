@@ -79,18 +79,6 @@ export function encodeL1Key(key: {}): string {
   }
 }
 
-const FRESH_STATS = (): L1Stats => ({
-  enabled: true,
-  hits: 0,
-  misses: 0,
-  sets: 0,
-  invalidations: 0,
-  evictions: 0,
-  staleHits: 0,
-  size: 0,
-  ipcAvoided: 0,
-});
-
 // Per-instance L1 cache. One LocalL1Cache per LRUCacheClustered.
 // Namespace clears establish a version floor. Key invalidations remove only
 // their entry and fence pending fills; releasing each fill reclaims its metadata.
@@ -101,7 +89,17 @@ export class LocalL1Cache<V extends {} = {}> {
   readonly #ttl?: number;
   #latestSeen = 0;
   readonly #pending = new Map<string, Set<L1Read>>();
-  readonly #stats = FRESH_STATS();
+  readonly #stats: L1Stats = {
+    enabled: true,
+    hits: 0,
+    misses: 0,
+    sets: 0,
+    invalidations: 0,
+    evictions: 0,
+    staleHits: 0,
+    size: 0,
+    ipcAvoided: 0,
+  };
   readonly #emit: L1EmitFn;
 
   constructor(opts: L1ConstructorOptions) {

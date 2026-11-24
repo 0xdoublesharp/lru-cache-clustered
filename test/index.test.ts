@@ -1677,3 +1677,33 @@ void test('allowStale, max, and ttl preserve local options when primary returns 
   assert.equal(await cache.allowStale(), true);
   await cache.destroy();
 });
+
+void test('fetch in ttl-only L1 mode invalidates stale local entries on forceRefresh bypass and oversize store', async () => {
+  const c1 = new LRUCacheClustered<string, string>({
+    namespace: 'ttl-only-fetch-bypass-invalidation',
+    max: 10,
+    localL1: { experimental: true, ttl: 5000, invalidation: 'ttl-only' },
+  });
+  const c2 = new LRUCacheClustered<string, string>({
+    namespace: 'ttl-only-fetch-oversize-invalidation',
+    maxSize: 10,
+    maxEntrySize: 5,
+    localL1: { experimental: true, ttl: 5000, invalidation: 'ttl-only' },
+  });
+  try {
+    await c1.set('k', 'v1', { updateL1: true });
+    assert.equal(await c1.get('k'), 'v1');
+    // Refresh via withoutLocal() (bypassL1=true): own fetchStore must drop stale local 'v1'.
+    assert.equal(await c1.withoutLocal().fetch('k', () => 'v2', { forceRefresh: true }), 'v2');
+    assert.equal(await c1.get('k'), 'v2');
+
+    await c2.set('k', 'v1', { size: 2, updateL1: true });
+    assert.equal(await c2.get('k'), 'v1');
+    // Oversize fetchStore deletes 'k' on primary (remaining TTL = 0); stale local 'v1' must be dropped.
+    assert.equal(await c2.fetch('k', () => 'v2-oversize', { forceRefresh: true, size: 6 }), 'v2-oversize');
+    assert.equal(await c2.get('k'), undefined);
+  } finally {
+    await c1.destroy();
+    await c2.destroy();
+  }
+});
