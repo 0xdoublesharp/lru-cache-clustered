@@ -111,7 +111,7 @@ export function wrap<K extends {}, V extends {}, U extends {}>(
       const encoded: Array<MSetEntry<K, U>> = [];
       for (const [k, v, entryOpts] of entries) {
         const ev = await enc(v);
-        encoded.push(entryOpts === undefined ? [k, ev] : [k, ev, entryOpts]);
+        encoded.push(entryOpts ? [k, ev, entryOpts] : [k, ev]);
       }
       return cache.mSet(encoded, opts);
     },

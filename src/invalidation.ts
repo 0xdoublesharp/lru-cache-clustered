@@ -1,5 +1,4 @@
-import Debug from 'debug';
-import { DEBUG_PREFIX, type InvalidationPush } from './messages.js';
+import { makeDebug, type InvalidationPush } from './messages.js';
 
 type Handler = (msg: InvalidationPush) => void;
 const key = Symbol.for('lru-cache-clustered.invalidations');
@@ -7,9 +6,9 @@ const subscribers = ((globalThis as Record<PropertyKey, unknown>)[key] ??= new M
   string,
   Set<Handler>
 >;
-const debug = Debug(`${DEBUG_PREFIX}-invalidations`);
+const debug = makeDebug('invalidations');
 
-export function subscribeMap(map: Map<string, Set<Handler>>, namespace: string, handler: Handler): () => void {
+export function subscribeMap<T>(map: Map<string, Set<T>>, namespace: string, handler: T): () => void {
   let handlers = map.get(namespace);
   if (!handlers) map.set(namespace, (handlers = new Set()));
   handlers.add(handler);
@@ -24,7 +23,7 @@ export function emitMap(map: Map<string, Set<Handler>>, msg: InvalidationPush, l
     try {
       handler(msg);
     } catch (error) {
-      log('invalidation handler failed: %s', error);
+      log('%s', error);
     }
   }
 }

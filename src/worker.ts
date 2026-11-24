@@ -1,19 +1,17 @@
-import { setTimeout, clearTimeout } from 'node:timers';
-import Debug from 'debug';
 import { emitMap, subscribeMap } from './invalidation.js';
 import {
-  DEBUG_PREFIX,
   SOURCE,
   deserializeError,
   isInvalidationPush,
   isOurMessage,
+  makeDebug,
   type InvalidationPush,
   type Request,
   type DispatchResult,
   type Response,
 } from './messages.js';
 
-const messagesDebug = Debug(`${DEBUG_PREFIX}-messages`);
+const messagesDebug = makeDebug('messages');
 
 // ESM, CommonJS, scoped and legacy copies all receive the same process IPC
 // messages. Share the counter across copies so their response listeners cannot
@@ -74,17 +72,13 @@ export function createIpcClient(proc: ProcessLike): IpcClient {
 
       callbacks.set(id, (response) => {
         clearTimeout(timer);
-        if (response.ok)
-          resolve({
-            value: response.value as T,
-            version: response.version ?? 0,
-            ttls: response.ttls,
-            evictedKeys: response.evictedKeys,
-          });
-        else reject(deserializeError(response.error));
+        if (response.ok) {
+          const { value, version = 0, ttls, evictedKeys } = response;
+          resolve({ value: value as T, version, ttls, evictedKeys });
+        } else reject(deserializeError(response.error));
       });
 
-      messagesDebug('worker -> primary', request);
+      messagesDebug('%O', request);
       const fail = (error: unknown) => {
         if (!callbacks.delete(id)) return;
         clearTimeout(timer);
@@ -119,7 +113,7 @@ function isOurResponse(value: unknown): value is Response {
   // When ok=false, validate the error payload shape too. Without this guard a
   // malformed error from a misbehaving primary would crash the message
   // listener in deserializeError(undefined) and take the worker down.
-  if (value.ok === false) {
+  if (!value.ok) {
     let error: unknown = value.error;
     // serializeError emits at most eight causes plus the root. Bound the
     // entire chain, including cycles, before recursive reconstruction.
@@ -149,9 +143,7 @@ let cachedDefaultClient: IpcClient | undefined;
 export function getDefaultClient(): IpcClient {
   if (!cachedDefaultClient) {
     if (typeof process.send !== 'function') {
-      throw new Error(
-        'lru-cache-clustered: worker IPC client requested in a process without `process.send` (not a cluster worker).',
-      );
+      throw new Error('not a cluster worker');
     }
     cachedDefaultClient = createIpcClient({
       send: process.send.bind(process),

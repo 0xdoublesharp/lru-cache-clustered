@@ -1,4 +1,6 @@
 import { LRUCache } from 'lru-cache';
+import { subscribeMap } from './invalidation.js';
+import { perfNow } from './messages.js';
 
 export type L1Stats = {
   enabled: true;
@@ -45,10 +47,7 @@ let nextObjectKeyId = 0;
 
 function objectKeyId(key: object): number {
   let id = objectKeyIds.get(key);
-  if (id === undefined) {
-    id = ++nextObjectKeyId;
-    objectKeyIds.set(key, id);
-  }
+  if (!id) objectKeyIds.set(key, (id = ++nextObjectKeyId));
   return id;
 }
 
@@ -62,7 +61,7 @@ function objectKeyId(key: object): number {
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
 export function encodeL1Key(key: {}): string {
   const t = typeof key;
-  if (t === 'symbol') throw new Error('L1 does not support symbol keys');
+  if (t === 'symbol') throw new Error('symbol keys unsupported');
   return t === 'object' || t === 'function'
     ? `${t[0]}:${objectKeyId(key)}`
     : `${t === 'bigint' ? 'i' : t[0]}:${key as string | number | boolean | bigint}`;
@@ -78,7 +77,7 @@ export class LocalL1Cache<V extends {} = {}> {
   readonly #ttl?: number;
   #latestSeen = 0;
   readonly #pending = new Map<string, Set<L1Read>>();
-  readonly #stats: L1Stats = {
+  readonly #stats: Omit<L1Stats, 'size'> = {
     enabled: true,
     hits: 0,
     misses: 0,
@@ -86,7 +85,6 @@ export class LocalL1Cache<V extends {} = {}> {
     invalidations: 0,
     evictions: 0,
     staleHits: 0,
-    size: 0,
     ipcAvoided: 0,
   };
   readonly #emit: L1EmitFn;
@@ -120,18 +118,18 @@ export class LocalL1Cache<V extends {} = {}> {
         ? this.#cache.get(encodedKey, { status })
         : this.#cache.peek(encodedKey, { allowStale: mode !== 'has' && this.#cache.allowStale });
     if (mode === 'peek' && entry && this.#cache.getRemainingTTL(encodedKey) < 0) status.returnedStale = true;
-    const expired =
-      entry !== undefined &&
-      (entry.version < this.#latestSeen ||
-        (entry.expiresAt !== undefined && globalThis.performance.now() >= entry.expiresAt));
-    if (entry && (expired || status.returnedStale)) {
-      // Neither a local sliding TTL nor allowStale may extend the primary's
-      // expiration deadline or revive a value invalidated by a write.
-      this.#stats.staleHits += 1;
-      this.#emit('stale-hit', { key: entry.key });
-      if (expired) {
-        this.#cache.delete(encodedKey);
-        entry = undefined;
+    if (entry) {
+      const expired =
+        entry.version < this.#latestSeen || (entry.expiresAt !== undefined && perfNow() >= entry.expiresAt);
+      if (expired || status.returnedStale) {
+        // Neither a local sliding TTL nor allowStale may extend the primary's
+        // expiration deadline or revive a value invalidated by a write.
+        this.#stats.staleHits += 1;
+        this.#emit('stale-hit', { key: entry.key });
+        if (expired) {
+          this.#cache.delete(encodedKey);
+          entry = undefined;
+        }
       }
     }
     if (!entry) {
@@ -156,32 +154,28 @@ export class LocalL1Cache<V extends {} = {}> {
     const existing = this.#cache.peek(encodedKey, { allowStale: true });
     if (
       version < this.#latestSeen ||
-      (existing !== undefined && version < existing.version) ||
+      (existing && version < existing.version) ||
       (read && (read.cancelled || version < read.version))
     ) {
       // Don't store an entry already known to be stale.
       return;
     }
-    const setOpts = this.#setOptions(ttl);
-    if (setOpts === false) return;
-    const expiresAt = ttl !== undefined && Number.isFinite(ttl) ? globalThis.performance.now() + ttl : undefined;
+    let setOpts: { ttl: number } | undefined;
+    let expiresAt: number | undefined;
+    if (Number.isFinite(ttl)) {
+      const capped = this.#ttl === undefined ? (ttl as number) : Math.min(ttl as number, this.#ttl);
+      if (capped <= 0) return;
+      setOpts = { ttl: capped };
+      expiresAt = perfNow() + (ttl as number);
+    }
     this.#cache.set(encodedKey, { value, version, expiresAt, key: eventKey }, setOpts);
     this.#stats.sets += 1;
     this.#emit('set', { key: eventKey, version });
   }
 
   trackRead(encodedKey: string): L1Read {
-    let pending = this.#pending.get(encodedKey);
-    if (!pending) this.#pending.set(encodedKey, (pending = new Set()));
-    const read: L1Read = {
-      version: this.#latestSeen,
-      cancelled: false,
-      release: () => {
-        pending.delete(read);
-        if (pending.size === 0 && this.#pending.get(encodedKey) === pending) this.#pending.delete(encodedKey);
-      },
-    };
-    pending.add(read);
+    const read = { version: this.#latestSeen, cancelled: false } as L1Read;
+    read.release = subscribeMap(this.#pending, encodedKey, read);
     return read;
   }
 
@@ -234,11 +228,5 @@ export class LocalL1Cache<V extends {} = {}> {
   // For tests / explicit teardown.
   destroy(): void {
     this.clear(false);
-  }
-
-  #setOptions(ttl: number | undefined): { ttl: number } | undefined | false {
-    if (ttl === undefined || !Number.isFinite(ttl)) return undefined;
-    const capped = this.#ttl === undefined ? ttl : Math.min(ttl, this.#ttl);
-    return capped > 0 ? { ttl: capped } : false;
   }
 }

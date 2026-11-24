@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import cluster from 'node:cluster';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -530,5 +531,185 @@ void test('same-value write updates entry size and max() preserves non-expiring 
   } finally {
     request(sizeNs, 'destroy');
     request(maxTtlNs, 'destroy');
+  }
+});
+
+void test('late worker attachment deduplicates fork events so requests never execute twice', async () => {
+  const { default: cluster } = await import('node:cluster');
+  const namespace = 'primary-dedup-worker-attach';
+  const listeners: Array<(msg: unknown) => void> = [];
+  const responses: unknown[] = [];
+  const fakeWorker = {
+    id: 99_123,
+    isConnected: () => true,
+    on(event: string, cb: (msg: unknown) => void) {
+      if (event === 'message') listeners.push(cb);
+    },
+    send(msg: unknown, cb?: (err: Error | null) => void) {
+      responses.push(msg);
+      cb?.(null);
+      return true;
+    },
+  };
+  try {
+    // Emitting fork twice for the same worker object (or late install + fork) must attach once.
+    cluster.emit('fork', fakeWorker);
+    cluster.emit('fork', fakeWorker);
+    assert.equal(listeners.length, 1, 'same worker must not receive duplicate IPC handlers');
+    listeners[0]?.({ id: '1', namespace, source: SOURCE, op: 'incr', key: 'counter' });
+    assert.equal(responses.length, 1);
+    assert.equal((request(namespace, 'get', { key: 'counter' }) as { value: number }).value, 1);
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('oversize fetchStore delivers computed value to registered followers and prunes lock', () => {
+  const namespace = 'primary-oversize-fetch-followers';
+  const state = (globalThis as Record<PropertyKey, unknown>)[Symbol.for('lru-cache-clustered.primary')] as {
+    fetchLocks: Map<string, Map<unknown, unknown>>;
+  };
+  try {
+    request(namespace, 'init', { options: { maxSize: 5 } });
+    const l = request(namespace, 'fetchClaim', { key: 'k', requestId: 'leader' });
+    assert.ok(l.ok);
+    const f = request(namespace, 'fetchClaim', { key: 'k', requestId: 'follower' });
+    assert.ok(f.ok);
+    const tok = (l.value as { token: string }).token;
+    const gen = (f.value as { generation: string }).generation;
+
+    const stored = request(namespace, 'fetchStore', { key: 'k', token: tok, value: 'big-val', size: 6 });
+    assert.ok(stored.ok);
+    assert.equal(stored.value, true);
+
+    // Registered follower must receive 'big-val' instead of failing as superseded, then lock prunes.
+    const fRes = request(namespace, 'fetchClaim', { key: 'k', requestId: 'follower', generation: gen });
+    assert.ok(fRes.ok);
+    assert.deepEqual(fRes.value, { kind: 'value', value: 'big-val' });
+    assert.equal(state.fetchLocks.has(namespace), false, 'lock must prune after last follower consumes value');
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('oversize incr rejects without deleting existing counter, and same-value size updates cover maxEntrySize and incr(0)', () => {
+  const counterNs = 'primary-oversize-incr';
+  const maxEntryNs = 'primary-same-value-maxentrysize';
+  try {
+    request(counterNs, 'init', { options: { maxSize: 10 } });
+    assert.equal((request(counterNs, 'incr', { key: 'c', amount: 3, size: 1 }) as { value: number }).value, 3);
+    const over = request(counterNs, 'incr', { key: 'c', amount: 1, size: 11 });
+    assert.equal(over.ok, false);
+    assert.equal((request(counterNs, 'get', { key: 'c' }) as { value: number }).value, 3);
+
+    // Same-value counter size update (no TTL and with TTL).
+    assert.equal((request(counterNs, 'incr', { key: 'c', amount: 0, size: 8 }) as { value: number }).value, 3);
+    assert.equal(caches.get(counterNs)?.info('c')?.size, 8);
+    assert.equal(
+      (request(counterNs, 'incr', { key: 'ct', amount: 1, size: 1, ttl: 10_000 }) as { value: number }).value,
+      1,
+    );
+    assert.equal((request(counterNs, 'incr', { key: 'ct', amount: 0, size: 2 }) as { value: number }).value, 1);
+    const ctInfo = caches.get(counterNs)?.info('ct');
+    assert.equal(ctInfo?.size, 2);
+    assert.ok(typeof ctInfo?.ttl === 'number' && ctInfo.ttl > 0 && ctInfo.ttl <= 10_000);
+
+    // Same-value size update with { max, maxEntrySize } (no maxSize).
+    request(maxEntryNs, 'init', { options: { max: 5, maxEntrySize: 10 } });
+    request(maxEntryNs, 'set', { key: 'a', value: 'same', size: 1 });
+    request(maxEntryNs, 'set', { key: 'a', value: 'same', size: 8 });
+    assert.equal(caches.get(maxEntryNs)?.info('a')?.size, 8);
+  } finally {
+    request(counterNs, 'destroy');
+    request(maxEntryNs, 'destroy');
+  }
+});
+
+void test('oversize setIfAbsent preserves readable stale entries when allowStale and noDeleteOnStaleGet are enabled', (t) => {
+  let now = 1000;
+  t.mock.method(performance, 'now', () => now);
+  const namespace = 'primary-oversize-sia-stale';
+  try {
+    request(namespace, 'init', {
+      options: { maxEntrySize: 5, max: 10, ttl: 50, allowStale: true, noDeleteOnStaleGet: true },
+    });
+    request(namespace, 'set', { key: 'k', value: 'stale-val', size: 1 });
+    now += 100;
+    assert.equal((request(namespace, 'peek', { key: 'k' }) as { value: unknown }).value, 'stale-val');
+
+    const sia = request(namespace, 'setIfAbsent', { key: 'k', value: 'too-big', size: 6 });
+    assert.ok(sia.ok);
+    assert.equal(sia.value, false);
+    assert.equal(
+      (request(namespace, 'peek', { key: 'k' }) as { value: unknown }).value,
+      'stale-val',
+      'oversize setIfAbsent must not delete a readable stale value',
+    );
+  } finally {
+    request(namespace, 'destroy');
+  }
+});
+
+void test('JSON null ttl/max inputs, load ttl validation/non-expiring preservation, and autopurge overflow guard', () => {
+  const ns = 'primary-json-null-and-load';
+  const apNs = 'primary-autopurge-overflow';
+  try {
+    request(ns, 'init', { options: { max: 10, ttl: 5000 } });
+    request(ns, 'set', { key: 'keep', value: 'v' });
+
+    // JSON IPC converts NaN/Infinity to null; mSet, ttl(), and max() must reject null.
+    assert.equal(request(ns, 'mSet', { entries: [['k', 'v', { ttl: null }]] }).ok, false);
+    assert.equal(request(ns, 'ttl', { value: null }).ok, false);
+    assert.equal(request(ns, 'max', { value: null }).ok, false);
+
+    // load() rejects negative/invalid ttl without clearing existing entries.
+    assert.equal(request(ns, 'load', { entries: [['bad', { value: 'v', ttl: -1 }]] }).ok, false);
+    assert.equal((request(ns, 'get', { key: 'keep' }) as { value: unknown }).value, 'v');
+
+    // load() preserves non-expiring snapshot entries (omitted ttl) even on a TTL cache.
+    assert.equal(request(ns, 'load', { entries: [['forever', { value: 'v' }]] }).ok, true);
+    assert.equal((request(ns, 'getRemainingTTL', { key: 'forever' }) as { value: number }).value, Infinity);
+
+    // 30-day TTL with ttlAutopurge=true must reject instead of spinning 1ms overflow timers.
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    assert.equal(request(apNs, 'init', { options: { max: 10, ttl: thirtyDays, ttlAutopurge: true } }).ok, false);
+    assert.equal(request(apNs, 'init', { options: { max: 10, ttl: 1000, ttlAutopurge: true } }).ok, true);
+    assert.equal(request(apNs, 'ttl', { value: thirtyDays }).ok, false);
+    assert.equal(request(apNs, 'set', { key: 'x', value: 1, ttl: thirtyDays }).ok, false);
+  } finally {
+    request(ns, 'destroy');
+    request(apNs, 'destroy');
+  }
+});
+
+void test('reentrant write during destroy preserves the recreated namespace version', async () => {
+  const { LRUCacheClustered } = await import('../src/index.ts');
+  const namespace = 'primary-reentrant-destroy-version';
+  const first = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  const second = new LRUCacheClustered<string, string>({
+    namespace,
+    max: 10,
+    localL1: { experimental: true, ttl: 5000 },
+  });
+  try {
+    await first.set('k', 'old');
+    await second.get('k');
+    let writePromise: Promise<boolean> | undefined;
+    second.once('l1:invalidate', () => {
+      writePromise = second.set('k', 'new');
+    });
+    await first.destroy();
+    await writePromise;
+
+    assert.equal(await second.get('k'), 'new');
+    const hitsBefore = second.localStats()!.hits;
+    assert.equal(await second.get('k'), 'new');
+    assert.equal(second.localStats()!.hits, hitsBefore + 1, 'recreated namespace must retain its version for L1 fills');
+  } finally {
+    await second.destroy();
   }
 });

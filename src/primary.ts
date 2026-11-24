@@ -1,12 +1,11 @@
 import cluster from 'node:cluster';
 import type { Worker } from 'node:cluster';
-import Debug from 'debug';
 import { LRUCache } from 'lru-cache';
 import { emitInvalidation } from './invalidation.js';
 import {
-  DEBUG_PREFIX,
   SOURCE,
   isOurMessage,
+  makeDebug,
   serializeError,
   type Request,
   type DispatchResult,
@@ -16,12 +15,14 @@ import {
   type InvalidationPush,
 } from './messages.js';
 
+export { cluster };
+
 // Distributive Omit so each member of the Request union keeps its own shape.
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 export type ExecPayload = DistributiveOmit<Request, 'id' | 'namespace' | 'source'>;
 
-const debug = Debug(`${DEBUG_PREFIX}-primary`);
-const messagesDebug = Debug(`${DEBUG_PREFIX}-messages`);
+const debug = makeDebug('primary');
+const messagesDebug = makeDebug('messages');
 
 // Public registry: namespace -> LRUCache. Keys/values constrained to non-nullish
 // per lru-cache@11 signature; we operate on `unknown` at the IPC boundary and
@@ -41,6 +42,7 @@ type FetchLock = {
   ownerWorkerId?: number;
   requestId?: string;
   claimedAt: number;
+  resolvedValue?: NonNullish;
 };
 
 // Lease window for a fetch claim. If the leader hasn't called fetchStore
@@ -50,7 +52,7 @@ type FetchLock = {
 // cluster.on('exit') handler). 30s is generous for typical user fetchers
 // and short enough that hung-leader incidents do not park requests forever.
 export const FETCH_LEASE_MS = 30_000;
-export const SUPERSEDED_ERROR = 'Fetch was superseded by a cache mutation and no current value remains';
+export const SUPERSEDED_ERROR = 'Fetch was superseded and no current value remains';
 
 type PrimaryState = {
   caches: Map<string, AnyCache>;
@@ -81,15 +83,16 @@ export const caches = primaryState.caches;
 export const stats = primaryState.stats;
 export const versions = primaryState.versions;
 const fetchLocks = primaryState.fetchLocks;
+const attachedWorkers = new WeakSet<Worker>();
 
 export function getNamespaceVersion(namespace: string): number {
-  return primaryState.versions.get(namespace) ?? 0;
+  return versions.get(namespace) ?? 0;
 }
 
 function bumpNamespaceVersion(namespace: string): number {
   const next = (primaryState.nextMutationVersion ?? 0) + 1;
   primaryState.nextMutationVersion = next;
-  primaryState.versions.set(namespace, next);
+  versions.set(namespace, next);
   return next;
 }
 
@@ -100,10 +103,6 @@ function getStats(namespace: string): Stats {
     stats.set(namespace, s);
   }
   return s;
-}
-
-function getCacheForPayload(namespace: string, payload: ExecPayload): AnyCache {
-  return caches.get(namespace) ?? getOrCreateCache(namespace, payload.cacheOptions);
 }
 
 function assertOptionsCompatible(namespace: string, cache: AnyCache, options?: SerializableLruOptions): void {
@@ -118,28 +117,33 @@ function assertOptionsCompatible(namespace: string, cache: AnyCache, options?: S
     if (value === undefined) continue;
     const expected = key === 'maxEntrySize' && !value ? current.maxSize : value;
     if (current[key] !== expected) {
-      mismatches.push(`${key}=${String(current[key])} (existing) != ${String(value)} (incoming)`);
+      mismatches.push(`${key}=${String(current[key])} != ${String(value)}`);
     }
   }
 
   if (mismatches.length > 0) {
-    throw new Error(`Conflicting options for namespace '${namespace}': ${mismatches.join(', ')}`);
+    throw new Error(`Conflicting options (${namespace}): ${mismatches.join(', ')}`);
   }
 }
 
 function requireNonNullish(label: string, value: unknown): NonNullish {
   if (value === null || value === undefined) {
-    throw new TypeError(`${label} must not be null or undefined`);
+    throw new TypeError(`cache ${label} must not be null or undefined`);
   }
   return value;
 }
 
-const requireKey = (key: unknown): NonNullish => requireNonNullish('cache key', key);
-const requireValue = (value: unknown): NonNullish => requireNonNullish('cache value', value);
+const requireKey = (key: unknown): NonNullish => requireNonNullish('key', key);
+const requireValue = (value: unknown): NonNullish => requireNonNullish('value', value);
 
-function validateTtl(ttl: number | undefined): void {
-  if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 0)) throw new TypeError('invalid ttl');
+function validateTtl(ttl: number | undefined, autopurge?: boolean): void {
+  if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < 0 || (autopurge && ttl > 0x7ffffffe))) {
+    throw new TypeError('invalid ttl');
+  }
 }
+
+const exceedsEntrySize = (cache: AnyCache, size: unknown): boolean =>
+  !!cache.maxEntrySize && Number.isInteger(size) && (size as number) > cache.maxEntrySize;
 
 function recordKeyWrite(namespace: string, key: NonNullish, stored: boolean): void {
   supersedeFetch(namespace, key);
@@ -147,25 +151,35 @@ function recordKeyWrite(namespace: string, key: NonNullish, stored: boolean): vo
   bumpNamespaceVersion(namespace);
 }
 
+const ALLOW_STALE = { allowStale: true } as const;
+
 function writeEntry(
   cache: AnyCache,
   key: NonNullish,
   value: NonNullish,
   opts: { ttl?: number; size?: number },
+  keepTTL = false,
 ): boolean {
   const { ttl, size } = opts;
-  validateTtl(ttl);
+  if (!keepTTL) validateTtl(ttl, cache.ttlAutopurge);
   if (
-    cache.maxSize &&
+    cache.maxEntrySize &&
     Number.isInteger(size) &&
     (size as number) > 0 &&
-    cache.peek(key, { allowStale: true }) === value &&
+    cache.peek(key, ALLOW_STALE) === value &&
     cache.info(key)?.size !== size
   ) {
+    const rem = keepTTL ? cache.getRemainingTTL(key) : ttl;
     cache.delete(key);
+    cache.set(key, value, { ttl: rem === undefined || Number.isFinite(rem) ? rem : 0, size });
+  } else {
+    cache.set(key, value, keepTTL ? { size, noUpdateTTL: true } : { ttl, size });
   }
-  cache.set(key, value, { ttl, size });
-  return cache.peek(key, { allowStale: true }) !== undefined;
+  return cache.peek(key, ALLOW_STALE) !== undefined;
+}
+
+function clearLeader(lock: FetchLock): void {
+  lock.token = lock.requestId = undefined;
 }
 
 function supersedeFetch(namespace: string, key: NonNullish): boolean {
@@ -185,7 +199,7 @@ function releaseFetchLocksForWorker(workerId: number): void {
       for (const [requestId, owner] of lock.followers) {
         if (owner === workerId) lock.followers.delete(requestId);
       }
-      if (lock.ownerWorkerId === workerId) lock.token = lock.requestId = undefined;
+      if (lock.ownerWorkerId === workerId) clearLeader(lock);
       pruneFetchLock(namespace, key, lock);
     }
   }
@@ -193,8 +207,9 @@ function releaseFetchLocksForWorker(workerId: number): void {
 
 function buildCache(options: SerializableLruOptions, s: Stats): AnyCache {
   if (options.maxSize && options.maxEntrySize && options.maxEntrySize > options.maxSize) {
-    throw new TypeError('maxEntrySize must not exceed maxSize');
+    throw new TypeError('invalid maxEntrySize');
   }
+  if (options.ttlAutopurge) validateTtl(options.ttl, true);
   const opts: SerializableLruOptions & {
     dispose: (_value: NonNullish, key: NonNullish, reason: LRUCache.DisposeReason) => void;
   } = {
@@ -217,7 +232,7 @@ export function getOrCreateCache(namespace: string, options?: SerializableLruOpt
     stats.delete(namespace);
     cache = buildCache(options ?? {}, getStats(namespace));
     caches.set(namespace, cache);
-    debug(`Created LRUCache for namespace '${namespace}'`);
+    debug('%s', namespace);
   } else {
     assertOptionsCompatible(namespace, cache, options);
   }
@@ -229,24 +244,28 @@ export function getOrCreateCache(namespace: string, options?: SerializableLruOpt
 // primary fast-path in `index.ts` call this. Avoids object/promise allocation
 // per call when no IPC is involved.
 export function dispatchOp(namespace: string, payload: ExecPayload, context: DispatchContext = {}): unknown {
+  const getCache = () => caches.get(namespace) ?? getOrCreateCache(namespace, payload.cacheOptions);
+  const getLock = (k: NonNullish) => fetchLocks.get(namespace)?.get(k);
   switch (payload.op) {
-    case 'init': {
-      const isNew = !caches.has(namespace);
-      const cache = getOrCreateCache(namespace, payload.options);
-      return { namespace, isNew, max: cache.max, version: getNamespaceVersion(namespace) };
-    }
+    case 'init':
+      return {
+        namespace,
+        isNew: !caches.has(namespace),
+        max: getOrCreateCache(namespace, payload.options).max,
+        version: getNamespaceVersion(namespace),
+      };
     case 'healthCheck':
       getOrCreateCache(namespace, payload.cacheOptions);
       return undefined;
     case 'destroy': {
       caches.get(namespace)?.clear();
-      const existed = [caches, stats, fetchLocks].filter((m) => m.delete(namespace)).length > 0;
+      const existed = Boolean(+caches.delete(namespace) | +stats.delete(namespace) | +fetchLocks.delete(namespace));
       if (existed) bumpNamespaceVersion(namespace);
       return existed;
     }
     case 'get': {
       const key = requireKey(payload.key);
-      const cache = payload.existingOnly ? caches.get(namespace) : getCacheForPayload(namespace, payload);
+      const cache = payload.existingOnly ? caches.get(namespace) : getCache();
       if (!cache) return undefined;
       const value = cache.get(key);
       getStats(namespace)[value !== undefined ? 'hits' : 'misses'] += 1;
@@ -254,21 +273,24 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     }
     case 'set': {
       const key = requireKey(payload.key);
-      const stored = writeEntry(getCacheForPayload(namespace, payload), key, requireValue(payload.value), payload);
+      const stored = writeEntry(getCache(), key, requireValue(payload.value), payload);
       recordKeyWrite(namespace, key, stored);
       return stored;
     }
     case 'setIfAbsent': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const key = requireKey(payload.key);
       if (cache.peek(key, { allowStale: false }) !== undefined) return false;
-      const stored = writeEntry(cache, key, requireValue(payload.value), payload);
-      if (stored) recordKeyWrite(namespace, key, true);
-      return stored;
+      const value = requireValue(payload.value);
+      validateTtl(payload.ttl, cache.ttlAutopurge);
+      if (exceedsEntrySize(cache, payload.size)) return false;
+      writeEntry(cache, key, value, payload);
+      recordKeyWrite(namespace, key, true);
+      return true;
     }
     case 'delete': {
       const key = requireKey(payload.key);
-      const deleted = getCacheForPayload(namespace, payload).delete(key);
+      const deleted = getCache().delete(key);
       const superseded = supersedeFetch(namespace, key);
       if (deleted) getStats(namespace).deletes += 1;
       if (deleted || superseded) bumpNamespaceVersion(namespace);
@@ -277,14 +299,14 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'has':
     case 'peek':
     case 'getRemainingTTL':
-      return getCacheForPayload(namespace, payload)[payload.op](requireKey(payload.key));
+      return getCache()[payload.op](requireKey(payload.key));
     case 'clear':
-      getCacheForPayload(namespace, payload).clear();
+      getCache().clear();
       fetchLocks.delete(namespace);
       bumpNamespaceVersion(namespace);
       return undefined;
     case 'mGet': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const s = getStats(namespace);
       return payload.keys.map(requireKey).map((key) => {
         const value = cache.get(key);
@@ -293,11 +315,11 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       });
     }
     case 'mSet': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const s = getStats(namespace);
       const entries = payload.entries.map(([key, value, entryOpts]) => {
-        const ttl = entryOpts?.ttl ?? payload.ttl;
-        validateTtl(ttl);
+        const ttl = entryOpts?.ttl === undefined ? payload.ttl : entryOpts.ttl;
+        validateTtl(ttl, cache.ttlAutopurge);
         return [requireKey(key), requireValue(value), ttl, entryOpts?.size ?? payload.size] as const;
       });
       let changed = false;
@@ -313,7 +335,7 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       return undefined;
     }
     case 'mDelete': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const s = getStats(namespace);
       const keys = payload.keys.map(requireKey);
       for (const key of keys) {
@@ -326,18 +348,21 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     case 'keys':
     case 'values':
     case 'entries':
-      return [...getCacheForPayload(namespace, payload)[payload.op]()];
+      return [...getCache()[payload.op]()];
     case 'dump':
-      return getCacheForPayload(namespace, payload).dump();
+      return getCache().dump();
     case 'load': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const entries = payload.entries.map(([key, entry]) => {
         const safeKey = requireKey(key);
-        const safeEntry = requireNonNullish('cache entry', entry) as { value?: unknown };
+        const safeEntry = requireNonNullish('entry', entry) as { value?: unknown; ttl?: number };
         requireValue(safeEntry.value);
+        validateTtl(safeEntry.ttl, cache.ttlAutopurge);
         // Shallow-copy each entry because lru-cache@11 rewrites `entry.start`
         // in place from Date.now() to performance.now() during load().
-        return [safeKey, { ...safeEntry }] as [NonNullish, LRUCache.Entry<NonNullish>];
+        const copy = { ...safeEntry } as LRUCache.Entry<NonNullish>;
+        if (cache.ttl && copy.ttl === undefined) copy.ttl = 0;
+        return [safeKey, copy] as [NonNullish, LRUCache.Entry<NonNullish>];
       });
       // load() clears first and can then fail on a later entry's size.
       // Publication must cover both that clear and any entries already loaded.
@@ -350,45 +375,44 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       return undefined;
     }
     case 'size':
-      return getCacheForPayload(namespace, payload).size;
+      return getCache().size;
     case 'stats': {
       const s = getStats(namespace);
-      s.size = getCacheForPayload(namespace, payload).size;
+      s.size = getCache().size;
       return { ...s };
     }
     case 'purgeStale': {
-      const purged = getCacheForPayload(namespace, payload).purgeStale();
+      const purged = getCache().purgeStale();
       if (purged) bumpNamespaceVersion(namespace);
       return purged;
     }
     case 'incr':
     case 'decr': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const key = requireKey(payload.key);
       const amount = payload.amount === undefined ? 1 : payload.amount;
       const current = cache.peek(key, { allowStale: false });
       const existed = current !== undefined;
-      const base = typeof current === 'number' ? current : 0;
-      const next = base + amount * (payload.op === 'decr' ? -1 : 1);
+      const next = (typeof current === 'number' ? current : 0) + amount * (payload.op === 'decr' ? -1 : 1);
       if (!Number.isFinite(amount) || !Number.isFinite(next)) throw new TypeError('invalid amount');
-      if (!existed) validateTtl(payload.ttl);
       const size = payload.size ?? (existed ? cache.info(key)?.size : undefined);
-      cache.set(key, next, existed ? { size, noUpdateTTL: true } : { ttl: payload.ttl, size });
-      recordKeyWrite(namespace, key, cache.peek(key, { allowStale: true }) !== undefined);
+      if (exceedsEntrySize(cache, size)) throw new RangeError('invalid size');
+      writeEntry(cache, key, next, { ttl: payload.ttl, size }, existed);
+      recordKeyWrite(namespace, key, true);
       return next;
     }
     case 'fetchClaim': {
       const key = requireKey(payload.key);
-      const existing = fetchLocks.get(namespace)?.get(key);
+      const existing = getLock(key);
       if (payload.generation !== undefined && existing?.generation !== payload.generation) {
         const value = caches.get(namespace)?.get(key);
         if (value !== undefined) return { kind: 'value', value };
         throw new Error(SUPERSEDED_ERROR);
       }
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       const now = Date.now();
       if (!payload.forceRefresh) {
-        const value = cache.get(key);
+        const value = cache.get(key) ?? existing?.resolvedValue;
         const s = getStats(namespace);
         if (value !== undefined) {
           if (payload.requestId) existing?.followers.delete(payload.requestId);
@@ -398,8 +422,11 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
         }
         if (payload.generation === undefined) s.misses += 1;
         if (existing?.token && now - existing.claimedAt < FETCH_LEASE_MS) {
-          if (payload.requestId) existing.followers.set(payload.requestId, context.workerId);
-          return payload.requestId ? { kind: 'follower', generation: existing.generation } : { kind: 'follower' };
+          if (payload.requestId) {
+            existing.followers.set(payload.requestId, context.workerId);
+            return { kind: 'follower', generation: existing.generation };
+          }
+          return { kind: 'follower' };
         }
       }
       const token = `fetch-${++primaryState.nextFetchToken}`;
@@ -418,43 +445,49 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
     }
     case 'fetchStore': {
       const key = requireKey(payload.key);
-      const lock = fetchLocks.get(namespace)?.get(key);
+      const lock = getLock(key);
       if (!lock || lock.token !== payload.token) return false;
-      const stored = writeEntry(getCacheForPayload(namespace, payload), key, requireValue(payload.value), payload);
-      recordKeyWrite(namespace, key, stored);
+      const value = requireValue(payload.value);
+      const stored = writeEntry(getCache(), key, value, payload);
+      if (stored || lock.followers.size === 0) {
+        recordKeyWrite(namespace, key, stored);
+      } else {
+        clearLeader(lock);
+        lock.resolvedValue = value;
+        bumpNamespaceVersion(namespace);
+      }
       return true;
     }
     case 'fetchAbort': {
       const key = requireKey(payload.key);
-      const lock = fetchLocks.get(namespace)?.get(key);
+      const lock = getLock(key);
       if (!lock || lock.token !== payload.token) return false;
-      lock.token = lock.requestId = undefined;
+      clearLeader(lock);
       pruneFetchLock(namespace, key, lock);
       return true;
     }
     case 'fetchRelease': {
       const key = requireKey(payload.key);
-      const lock = fetchLocks.get(namespace)?.get(key);
+      const lock = getLock(key);
       if (!lock || (payload.generation !== undefined && lock.generation !== payload.generation)) return false;
       let removed = lock.followers.delete(payload.requestId);
       if (lock.requestId !== undefined && lock.requestId === payload.requestId) {
-        lock.token = lock.requestId = undefined;
+        clearLeader(lock);
         removed = true;
       }
       pruneFetchLock(namespace, key, lock);
       return removed;
     }
     case 'max': {
-      const cache = getCacheForPayload(namespace, payload);
-      if (typeof payload.value === 'number' && payload.value !== cache.max) {
-        const s = getStats(namespace);
+      const cache = getCache();
+      if (payload.value !== undefined && payload.value !== cache.max) {
         const opts: SerializableLruOptions = { max: payload.value };
         for (const k of 'maxSize maxEntrySize ttl allowStale updateAgeOnGet updateAgeOnHas noDeleteOnStaleGet ttlAutopurge'.split(
           ' ',
         )) {
           (opts as Record<string, unknown>)[k] = (cache as unknown as Record<string, unknown>)[k];
         }
-        const replacement = buildCache(opts, s);
+        const replacement = buildCache(opts, getStats(namespace));
         const dumped = cache.dump();
         if (opts.ttl) for (const [, e] of dumped) if (e.ttl === undefined) e.ttl = 0;
         replacement.load(dumped);
@@ -466,9 +499,9 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       return cache.max;
     }
     case 'ttl': {
-      const cache = getCacheForPayload(namespace, payload);
-      if (typeof payload.value === 'number') {
-        validateTtl(payload.value);
+      const cache = getCache();
+      if (payload.value !== undefined) {
+        validateTtl(payload.value, cache.ttlAutopurge);
         if (!payload.value && !cache.max && !cache.maxSize) throw new TypeError('invalid ttl');
         if (payload.value !== cache.ttl) {
           cache.ttl = payload.value;
@@ -478,7 +511,7 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
       return cache.ttl;
     }
     case 'allowStale': {
-      const cache = getCacheForPayload(namespace, payload);
+      const cache = getCache();
       if (typeof payload.value === 'boolean') cache.allowStale = payload.value;
       return cache.allowStale;
     }
@@ -489,22 +522,16 @@ export function dispatchOp(namespace: string, payload: ExecPayload, context: Dis
   }
 }
 
-// Bulk ops broadcast a namespace-wide invalidate; single-key ops broadcast the
-// specific key. Reasoning in spec section 5.3.
-const BULK_BROADCAST_OPS: ReadonlySet<string> = new Set(
-  'destroy clear purgeStale mSet mDelete load max ttl'.split(' '),
-);
+export const hasOp = (list: string, op: string): boolean => list.includes(` ${op} `);
 
 export function buildInvalidation(
   namespace: string,
   payload: ExecPayload,
   version: number,
 ): InvalidationPush | undefined {
-  if (BULK_BROADCAST_OPS.has(payload.op)) {
+  if (hasOp(' destroy clear purgeStale mSet mDelete load max ttl ', payload.op)) {
     return { source: SOURCE, push: 'l1:invalidate-namespace', namespace, version };
   }
-  // Single-key mutating ops carry `key`. Read ops don't reach here because
-  // dispatchAndBroadcast checks the version-bump signal before invoking us.
   const key = (payload as { key?: unknown }).key;
   /* c8 ignore next -- all current version-bumping single-key ops validate a non-nullish key before this point. */
   if (key === undefined || key === null) return undefined;
@@ -513,17 +540,15 @@ export function buildInvalidation(
 
 function sendToWorker(worker: Worker, msg: Response | InvalidationPush): void {
   if (!worker.isConnected()) return;
-  const logFailure = (error: unknown) => debug(`worker ${worker.id} send failed: %s`, error);
+  const onErr = (e: unknown) => {
+    if (e) debug('%s', e);
+  };
   try {
-    worker.send(msg, (error: Error | null) => {
-      if (error) logFailure(error);
-    });
-  } catch (err) {
-    logFailure(err);
+    worker.send(msg, onErr);
+  } catch (e) {
+    onErr(e);
   }
 }
-
-const EVICTING_OPS: ReadonlySet<string> = new Set('set setIfAbsent mSet load incr decr fetchStore max'.split(' '));
 
 function publishInvalidation(msg: InvalidationPush): void {
   emitInvalidation(msg);
@@ -538,7 +563,9 @@ export function dispatchAndBroadcast(
   context: DispatchContext = {},
 ): DispatchResult<unknown> {
   const before = getNamespaceVersion(namespace);
-  const capture = EVICTING_OPS.has(payload.op) ? { namespace, keys: [] as NonNullish[] } : undefined;
+  const capture = hasOp(' set setIfAbsent mSet load incr decr fetchStore max ', payload.op)
+    ? { namespace, keys: [] as NonNullish[] }
+    : undefined;
   const previousCapture = primaryState.activeEvictions;
   primaryState.activeEvictions = capture;
   let value: unknown;
@@ -559,8 +586,9 @@ export function dispatchAndBroadcast(
         }
       }
     }
-    // Keep the final version in this response and push, then release metadata.
-    if (payload.op === 'destroy') versions.delete(namespace);
+    // Keep the final version in this response and push, then release metadata
+    // unless a reentrant invalidation listener already recreated the namespace.
+    if (payload.op === 'destroy' && versions.get(namespace) === after) versions.delete(namespace);
   }
   const result: DispatchResult<unknown> = { value, version: after };
   if (capture?.keys.length) result.evictedKeys = capture.keys;
@@ -577,19 +605,13 @@ export function dispatchAndBroadcast(
 
 export function handleRequest(request: Request, context: DispatchContext = {}): Response {
   if (!request || typeof request !== 'object') {
-    return err(request, 'invalid request: not an object');
+    return err(request, 'not an object');
   }
-  // Validate the full Request shape before dispatching. Without this guard,
-  // a malformed payload reaching handleRequest directly (the IPC entry point
-  // already filters via isOurRequest, but the function is exported and could
-  // be called from anywhere) would call dispatchOp with undefined fields and
-  // could mutate the namespace registry under non-string keys.
   if (!isOurRequest(request)) {
-    return err(request, 'invalid request: missing required fields');
+    return err(request, 'invalid request');
   }
   try {
-    const result = dispatchAndBroadcast(request.namespace, request, context);
-    return { id: request.id, source: SOURCE, ok: true, ...result };
+    return { id: request.id, source: SOURCE, ok: true, ...dispatchAndBroadcast(request.namespace, request, context) };
   } catch (e) {
     return err(request, e);
   }
@@ -597,7 +619,7 @@ export function handleRequest(request: Request, context: DispatchContext = {}): 
 
 function err(request: unknown, cause: unknown): Response {
   const id =
-    typeof request === 'object' && request !== null && typeof (request as { id?: unknown }).id === 'string'
+    request && typeof request === 'object' && typeof (request as { id?: unknown }).id === 'string'
       ? (request as { id: string }).id
       : '';
   return { id, source: SOURCE, ok: false, error: serializeError(cause) };
@@ -622,9 +644,11 @@ export function installClusterListener(): void {
 }
 
 function attachWorkerHandler(worker: Worker): void {
+  if (attachedWorkers.has(worker)) return;
+  attachedWorkers.add(worker);
   worker.on('message', (raw: unknown) => {
     if (!isOurRequest(raw)) return;
-    messagesDebug(`primary <- worker ${worker.id}`, raw);
+    messagesDebug('%d', worker.id, raw);
     const response = handleRequest(raw, { workerId: worker.id });
     // The worker can disconnect between sending a request and us sending the
     // response. send() in that window throws synchronously; left unhandled,

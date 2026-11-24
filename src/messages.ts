@@ -1,3 +1,5 @@
+import Debug from 'debug';
+
 // Short sentinel for IPC payload filtering. Each request and response carries
 // this string so the listener can ignore foreign messages on the shared cluster
 // IPC channel. Kept short (6 bytes) to minimize wire overhead — at 10k ops/sec
@@ -7,7 +9,8 @@ type Source = typeof SOURCE;
 
 // Keep the debug namespace unscoped so it stays ergonomic in `DEBUG=...` and
 // stable across the canonical scoped package and the mirrored legacy publish.
-export const DEBUG_PREFIX = 'lru-cache-clustered';
+export const makeDebug = (suffix: string) => Debug(`lru-cache-clustered-${suffix}`);
+export const perfNow = () => globalThis.performance.now();
 
 type RequestBase = {
   id: string;
@@ -108,15 +111,12 @@ const SERIALIZE_CAUSE_MAX_DEPTH = 8;
 
 export function serializeError(err: unknown, depth = 0, seen = new Set<object>()): SerializedError {
   if (err instanceof Error) {
-    if (seen.has(err)) {
-      return { name: err.name, message: '[circular cause]' };
-    }
+    const { name, message, stack, code, cause } = err as Error & { code?: unknown; cause?: unknown };
+    if (seen.has(err)) return { name, message: '[circular cause]' };
     seen.add(err);
-    const out: SerializedError = { name: err.name, message: err.message };
-    if (err.stack) out.stack = err.stack;
-    const code = (err as { code?: unknown }).code;
+    const out: SerializedError = { name, message };
+    if (stack) out.stack = stack;
     if (typeof code === 'string' || typeof code === 'number') out.code = code;
-    const cause = (err as { cause?: unknown }).cause;
     if (cause !== undefined) {
       out.cause =
         depth + 1 >= SERIALIZE_CAUSE_MAX_DEPTH
@@ -129,11 +129,12 @@ export function serializeError(err: unknown, depth = 0, seen = new Set<object>()
 }
 
 export function deserializeError(payload: SerializedError): Error {
-  const err = new Error(payload.message);
-  err.name = payload.name;
-  if (payload.stack) err.stack = payload.stack;
-  if (payload.code !== undefined) (err as { code?: unknown }).code = payload.code;
-  if (payload.cause !== undefined) (err as { cause?: unknown }).cause = deserializeError(payload.cause);
+  const { name, message, stack, code, cause } = payload;
+  const err = new Error(message);
+  err.name = name;
+  if (stack) err.stack = stack;
+  if (code !== undefined) (err as { code?: unknown }).code = code;
+  if (cause !== undefined) (err as { cause?: unknown }).cause = deserializeError(cause);
   return err;
 }
 
@@ -145,12 +146,14 @@ export type InvalidationPush =
   | { source: Source; push: 'l1:invalidate-namespace'; namespace: string; version: number };
 
 export function isOurMessage(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && (value as { source?: unknown }).source === SOURCE;
+  return !!value && typeof value === 'object' && (value as { source?: unknown }).source === SOURCE;
 }
 
 export function isInvalidationPush(value: unknown): value is InvalidationPush {
-  if (!isOurMessage(value) || typeof value.namespace !== 'string' || !Number.isFinite(value.version)) {
-    return false;
-  }
-  return value.push === 'l1:invalidate' || value.push === 'l1:invalidate-namespace';
+  return (
+    isOurMessage(value) &&
+    typeof value.namespace === 'string' &&
+    Number.isFinite(value.version) &&
+    (value.push === 'l1:invalidate' || value.push === 'l1:invalidate-namespace')
+  );
 }
