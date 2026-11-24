@@ -1,3 +1,30 @@
+# 2.1.4 / 2026-11-23
+
+## Primary and single-flight fixes
+
+- Deduplicate cluster worker `message` listener attachment so importing or bootstrapping the primary in the same turn as `cluster.fork()` never executes worker requests twice.
+- Release timed-out leader fetch claims immediately via `ownerRequestId`, prune promoted followers from follower sets before leadership promotion, and prevent polling followers from inflating primary `misses` statistics.
+- Deliver oversized (`size > maxEntrySize`) `fetch()` results to registered followers and prune the fetch lock once they drain, without admitting oversized entries into the cache or inflating `sets`.
+- Report `false` from `set()` and `setIfAbsent()` when `size > maxEntrySize` prevents admission; keep readable stale entries intact on oversized `setIfAbsent()` under `allowStale` + `noDeleteOnStaleGet`; reject oversized `incr()`/`decr()` with `RangeError` without deleting an existing counter.
+- Validate non-negative integer TTLs across `set`, `setIfAbsent`, `mSet`, `fetchStore`, `load`, `ttl()`, and constructor options, rejecting JSON-coerced `null` inputs, `ttl: 0` on TTL-only caches, and TTLs exceeding Node.js's 32-bit timer limit (`2_147_483_646` ms) when `ttlAutopurge` is enabled.
+- Validate `maxEntrySize <= maxSize` on cache creation, keep `maxEntrySize: 0` option compatibility checks accurate, reject non-finite counter amounts or overflow in `incr()`/`decr()`, validate all `mGet()` keys before mutating stats, and reject nullish entries in `load()` before clearing the cache.
+- Update stored entry sizes on same-value writes across `maxSize`, `maxEntrySize`, and `incr(key, 0, { size })`, avoid mutating caller `load()` entry objects in place, preserve non-expiring entries across `load()` and `max()` rebuilds, and clear discarded caches on `destroy()` and `max()` rebuilds so autopurge timers are released.
+- Keep recreated namespace version records when a reentrant invalidation listener writes during `destroy()`.
+
+## Local L1, client, and codec fixes
+
+- Reject non-finite or non-positive `localL1.ttl`, honor explicit `localL1.ttl` values below 100 ms (clamped to primary TTL and >= 1 ms), reject non-finite versions on invalidation pushes, and preserve `l1:evict` consistency via `disposeAfter`.
+- Snapshot eager worker L1 fills (`set(..., { updateL1: true })` and `fetch()` leader fills) through V8 serialization with a JSON fallback so caller mutations never corrupt L1 while preserving `Buffer` and `toJSON()` values.
+- Prevent `destroy()` during an in-flight `fetch()` from re-subscribing the destroyed instance, bypass local in-flight `fetch()` deduplication on `bypassL1` / `withoutLocal()`, unblock same-instance fetches after mutation or lease expiry, and preserve the bypass wrapper when chaining `on()`, `off()`, and `once()` on `withoutLocal()`.
+- Self-invalidate `ttl-only` L1 entries on `fetch()` leader stores, `forceRefresh` bypasses, and oversized writes, and prevent `init()`/`destroy()` races from leaking L1 subscriptions.
+- Handle `failsafe: 'resolve'` timeouts safely in `wrap().values()` and `wrap().entries()`, allow `memoize()` to accept `WrappedCache`, and export `L1Stats`, `SerializableLruOptions`, `Stats`, `FetchOptions`, `ReadOptions`, `WriteOptions`, `LocalL1Options`, and `MSetEntry`.
+
+## Formal verification
+
+- Add TLA+ model checks (`formal/tla/L1Coherence.tla`, `formal/tla/FetchSingleFlight.tla`) and Lean 4 proofs (`formal/lean/Formal/*.lean`) run via `pnpm formal`, covering L1 version fencing, non-vacuous queue drainage, TTL bounds, key-encoding injectivity, and single-flight leader/follower/oversize lifecycle safety.
+
+The runtime dependencies and Node.js 22 minimum are unchanged.
+
 # 2.1.3 / 2026-11-08
 
 - Simplify the README, consolidate runnable examples, and redraw the cache topology with larger labels and a high-resolution PNG embed linked to the SVG.

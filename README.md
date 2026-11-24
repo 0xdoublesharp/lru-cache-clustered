@@ -40,7 +40,7 @@ Requires **Node.js 22 or newer**. Includes ESM and CommonJS builds and TypeScrip
 
 > `@0xdoublesharp/lru-cache-clustered` is the canonical package name. `lru-cache-for-clusters-as-promised` is published from the same build at the same version.
 
-**2.1.3** is a maintenance release with clearer documentation and security updates to development tooling. See the [release notes](./CHANGELOG.md#213--2026-11-08) for details.
+**2.1.4** hardens primary cache validation, single-flight fetch coordination, worker listener attachment, and local L1 coherence, backed by TLA+ and Lean 4 formal verification. See the [release notes](./CHANGELOG.md#214--2026-11-23) for details.
 
 ## Quick start
 
@@ -131,11 +131,11 @@ const products = new LRUCacheClustered<string, Product>({
 
 > L1 improves repeated read latency by avoiding IPC, but it can briefly serve stale data. Keep L1 TTL short and bypass L1 for correctness-sensitive reads.
 
-Set `experimental: true` to opt in. Without an explicit local TTL, the default is 10% of a positive primary TTL, up to 5 seconds, with a 100 ms floor. With no primary expiration, including `ttl: 0`, it defaults to 5 seconds. Each local entry is also capped at the remaining lifetime reported by the primary.
+Set `experimental: true` to opt in. Explicit `localL1.ttl` values must be positive finite numbers and are honored directly (clamped to the primary TTL with a 1 ms floor). Without an explicit local TTL, the default is 10% of a positive primary TTL, up to 5 seconds, with a 100 ms floor. With no primary expiration, including `ttl: 0`, it defaults to 5 seconds. Each local entry is also capped at the remaining lifetime reported by the primary.
 
 Reuse one cache instance per namespace in each worker. Each constructor or `getInstance()` call creates a separate local L1, so recreating the instance per request loses its warm entries.
 
-A cold `fetch()` claims the key and stores the result in two IPC requests. Followers poll the claim once per cycle and reuse the leader's result.
+A cold `fetch()` claims the key and stores the result in two IPC requests. Followers poll the claim once per cycle without inflating primary miss counts and reuse the leader's result, including oversized values (`size > maxEntrySize`) that are not admitted into the primary cache.
 
 L1 misses receive values and remaining TTLs in one primary response. A cold `mGet()` uses one IPC request for the batch, and a fully warm batch uses none. Local hits cannot extend an entry past the primary expiration recorded in that response, even with `updateAgeOnGet` or `allowStale` enabled.
 
@@ -235,7 +235,7 @@ Function-valued `lru-cache` options such as `dispose`, `disposeAfter`, `sizeCalc
 
 > **`failsafe: 'resolve'` caveat.** Most single-result operations return `undefined` on an IPC timeout with `'resolve'`, even when their declared return type differs. `mGet()` can return an empty or partial map. `fetch()`, `getInstance()`, and `healthCheck()` reject on IPC timeouts. For `get` / `peek` that is natural; for `has` / `set` / `delete` / `incr` / `decr` / `size` it can surprise callers (`undefined + 1 === NaN`). Use `'reject'` if typed-shape correctness on timeout matters.
 
-> **Size-bounded caches.** When you use `maxSize` or `maxEntrySize`, provide `size` on every write path (`set`, `setIfAbsent`, `mSet`, `fetch`, `memoize`, and the first `incr` / `decr` for a counter key). `sizeCalculation` does not cross IPC, so the primary cannot infer it for you.
+> **Size-bounded caches.** When you use `maxSize` or `maxEntrySize`, provide `size` on every write path (`set`, `setIfAbsent`, `mSet`, `fetch`, `memoize`, and the first `incr` / `decr` for a counter key). `sizeCalculation` does not cross IPC, so the primary cannot infer it for you. `maxEntrySize` cannot exceed `maxSize`. Oversized writes (`size > maxEntrySize`) return `false` without incrementing `sets`, oversized `setIfAbsent()` preserves readable stale entries under `allowStale` + `noDeleteOnStaleGet`, and oversized `incr()` / `decr()` reject with `RangeError` without deleting an existing counter. When `ttlAutopurge: true` is set, TTL values cannot exceed Node.js's 32-bit timer limit (`2_147_483_646` ms).
 
 > **Fail-fast startup.** `LRUCacheClustered.getInstance()` and `cache.healthCheck()` always reject if the primary cannot answer, regardless of `failsafe`, so you can use them as hard startup checks.
 
@@ -255,15 +255,15 @@ The same methods work in the primary and in workers. Await shared-cache operatio
 
 ### Core
 
-| Method                                        | Returns                   | Notes                                                          |
-| --------------------------------------------- | ------------------------- | -------------------------------------------------------------- |
-| `get(key, { bypassL1? })`                     | `Promise<V \| undefined>` |                                                                |
-| `set(key, value, { ttl?, size?, updateL1? })` | `Promise<boolean>`        | `updateL1` populates the caller's L1 after a successful write. |
-| `setIfAbsent(key, value, { ttl?, size? })`    | `Promise<boolean>`        | Atomic on the primary. `false` if the key already exists.      |
-| `delete(key)`                                 | `Promise<boolean>`        |                                                                |
-| `has(key, { bypassL1? })`                     | `Promise<boolean>`        |                                                                |
-| `peek(key, { bypassL1? })`                    | `Promise<V \| undefined>` | Does not update LRU position.                                  |
-| `clear()`                                     | `Promise<void>`           | Clears the primary cache and this instance's L1.               |
+| Method                                        | Returns                   | Notes                                                                                                              |
+| --------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `get(key, { bypassL1? })`                     | `Promise<V \| undefined>` |                                                                                                                    |
+| `set(key, value, { ttl?, size?, updateL1? })` | `Promise<boolean>`        | Returns `false` if `size > maxEntrySize` prevents admission. `updateL1` populates the caller's L1 after admission. |
+| `setIfAbsent(key, value, { ttl?, size? })`    | `Promise<boolean>`        | Atomic on the primary. `false` if the key already exists.                                                          |
+| `delete(key)`                                 | `Promise<boolean>`        |                                                                                                                    |
+| `has(key, { bypassL1? })`                     | `Promise<boolean>`        |                                                                                                                    |
+| `peek(key, { bypassL1? })`                    | `Promise<V \| undefined>` | Does not update LRU position.                                                                                      |
+| `clear()`                                     | `Promise<void>`           | Clears the primary cache and this instance's L1.                                                                   |
 
 ### Multi
 
@@ -302,31 +302,31 @@ Count events without workers overwriting each other, or load a missing value onc
 
 ### Local L1
 
-| Method / event                                    | Returns / payload         | Notes                                                                                    |
-| ------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------- |
-| `localStats()`                                    | `L1Stats \| undefined`    | `undefined` when local L1 is disabled.                                                   |
-| `clearLocal()`                                    | `void`                    | Local-only flush.                                                                        |
-| `invalidateLocal(key)`                            | `void`                    | Local-only single-key invalidation.                                                      |
-| `withoutLocal()`                                  | `LRUCacheClustered<K, V>` | Bypass view for `get`, `has`, `peek`, `mGet`, and `fetch`; writes pass through normally. |
-| `on('l1:hit' \| 'l1:miss' \| 'l1:set', listener)` | `{ namespace, key }`      | Key is the original cache key, not an internal encoded key.                              |
-| `on('l1:invalidate', listener)`                   | `{ namespace, key }`      | `key` may be `'*'` for namespace-wide invalidation.                                      |
-| `on('l1:evict' \| 'l1:stale-hit', listener)`      | `{ namespace, key }`      | `stale-hit` also fires when an expired or version-stale local entry is rejected.         |
-| `off(event, listener)` / `once(event, listener)`  | `this`                    | Standard event helpers.                                                                  |
+| Method / event                                    | Returns / payload         | Notes                                                                                                                                       |
+| ------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `localStats()`                                    | `L1Stats \| undefined`    | `undefined` when local L1 is disabled.                                                                                                      |
+| `clearLocal()`                                    | `void`                    | Local-only flush.                                                                                                                           |
+| `invalidateLocal(key)`                            | `void`                    | Local-only single-key invalidation.                                                                                                         |
+| `withoutLocal()`                                  | `LRUCacheClustered<K, V>` | Bypass view for `get`, `has`, `peek`, `mGet`, and `fetch` (including local in-flight dedup); chaining `on`/`off`/`once` preserves the view. |
+| `on('l1:hit' \| 'l1:miss' \| 'l1:set', listener)` | `{ namespace, key }`      | Key is the original cache key, not an internal encoded key.                                                                                 |
+| `on('l1:invalidate', listener)`                   | `{ namespace, key }`      | `key` may be `'*'` for namespace-wide invalidation.                                                                                         |
+| `on('l1:evict' \| 'l1:stale-hit', listener)`      | `{ namespace, key }`      | `stale-hit` also fires when an expired or version-stale local entry is rejected.                                                            |
+| `off(event, listener)` / `once(event, listener)`  | `this`                    | Standard event helpers.                                                                                                                     |
 
 ### Lifecycle, metrics, tunables
 
-| Method                 | Returns                 | Notes                                                                                                                                           |
-| ---------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `getRemainingTTL(key)` | `Promise<number>`       | ms until expiry. `Infinity` for keys with no TTL; `0` for missing keys.                                                                         |
-| `purgeStale()`         | `Promise<boolean>`      | Removes expired entries.                                                                                                                        |
-| `healthCheck()`        | `Promise<void>`         | Verifies that the primary can resolve the namespace and answer requests.                                                                        |
-| `stats()`              | `Promise<Stats>`        | `{ hits, misses, sets, deletes, evictions, size, namespace }`.                                                                                  |
-| `destroy()`            | `Promise<boolean>`      | Removes the namespace cache, stats, and primary-side coordination state. Later use of the same instance recreates it with the original options. |
-| `getCache()`           | `LRUCache \| undefined` | Underlying `lru-cache` for this namespace. **Primary only**.                                                                                    |
-| `ready`                | `Promise<void>`         | Waits for worker initialization but swallows failures. Use `getInstance()` when initialization errors should reject.                            |
-| `max(value?)`          | `Promise<number>`       | Getter and setter. Setter preserves primary entries and remaining TTL metadata, then clears this instance's L1.                                 |
-| `ttl(value?)`          | `Promise<number>`       | Getter and setter. Setter clears this instance's L1.                                                                                            |
-| `allowStale(value?)`   | `Promise<boolean>`      | Getter and setter.                                                                                                                              |
+| Method                 | Returns                 | Notes                                                                                                                                              |
+| ---------------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `getRemainingTTL(key)` | `Promise<number>`       | ms until expiry. `Infinity` for keys with no TTL; `0` for missing keys.                                                                            |
+| `purgeStale()`         | `Promise<boolean>`      | Removes expired entries.                                                                                                                           |
+| `healthCheck()`        | `Promise<void>`         | Verifies that the primary can resolve the namespace and answer requests.                                                                           |
+| `stats()`              | `Promise<Stats>`        | `{ hits, misses, sets, deletes, evictions, size, namespace }`.                                                                                     |
+| `destroy()`            | `Promise<boolean>`      | Removes the namespace cache, stats, and primary-side coordination state. Later use of the same instance recreates it with the original options.    |
+| `getCache()`           | `LRUCache \| undefined` | Underlying `lru-cache` for this namespace. **Primary only**.                                                                                       |
+| `ready`                | `Promise<void>`         | Waits for worker initialization but swallows failures. Use `getInstance()` when initialization errors should reject.                               |
+| `max(value?)`          | `Promise<number>`       | Getter and setter. Setter preserves primary entries, remaining TTLs, and non-expiring entries, then clears this instance's L1.                     |
+| `ttl(value?)`          | `Promise<number>`       | Getter and setter. Validates non-negative integers (rejecting `0` on TTL-only caches and timer-overflow values with `ttlAutopurge`) and clears L1. |
+| `allowStale(value?)`   | `Promise<boolean>`      | Getter and setter.                                                                                                                                 |
 
 ## Compression and codecs
 
@@ -359,7 +359,7 @@ await cache.get('user:42'); // decoded back to { id: 42, name: 'ada' }
 
 ## `memoize` helper
 
-`memoize(cache, fn, keyFn, opts)` calls `cache.fetch()` under the hood. `keyFn` must include every input that can change the result, including tenant or permission context when relevant.
+`memoize(cache, fn, keyFn, opts)` accepts either `LRUCacheClustered` or a `WrappedCache` from `wrap()` and calls `cache.fetch()` under the hood. `keyFn` must include every input that can change the result, including tenant or permission context when relevant.
 
 ```ts
 import { LRUCacheClustered, memoize } from '@0xdoublesharp/lru-cache-clustered';
