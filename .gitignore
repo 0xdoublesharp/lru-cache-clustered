@@ -11,3 +11,8 @@ docs/superpowers/
 
 # Git worktrees
 .worktrees/
+
+# Formal verification build/state caches
+formal/lean/.lake/
+formal/tla/states/
+formal/tla/*_TTrace_*

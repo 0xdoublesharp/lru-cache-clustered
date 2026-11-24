@@ -52,6 +52,9 @@
     "knip": "knip",
     "size": "size-limit",
     "type-coverage": "type-coverage --at-least 99",
+    "formal:tla": "node scripts/run-tla.mjs",
+    "formal:lean": "node scripts/run-lean.mjs",
+    "formal": "pnpm formal:tla && pnpm formal:lean",
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm knip && pnpm type-coverage && pnpm build && pnpm size",
     "prepublishOnly": "pnpm check",
     "prepare": "husky"

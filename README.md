@@ -438,6 +438,7 @@ pnpm check
 | `pnpm test`          | Unit, fuzz, and real cluster-worker tests.                                                             |
 | `pnpm test:coverage` | Text and LCOV reports in `coverage/`; requires 100% source statements, branches, functions, and lines. |
 | `pnpm build`         | ESM and CommonJS bundles with TypeScript declarations in `dist/`.                                      |
+| `pnpm formal`        | Run TLA+ (TLC) model checks and Lean 4 proofs under [`formal/`](./formal/README.md).                   |
 | `pnpm bench`         | Compare worker reads with and without local L1.                                                        |
 | `pnpm example:users` | Start the shared user-cache example.                                                                   |
 

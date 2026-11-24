@@ -2,6 +2,7 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": ["bench/**/*.ts", "examples/**/*.ts", "scripts/**/*.mjs", "test/**/*.test.ts"],
   "project": ["bench/**/*.ts", "examples/**/*.ts", "scripts/**/*.mjs", "src/**/*.ts", "test/**/*.ts"],
+  "ignoreBinaries": ["java"],
   "rules": {
     "duplicates": "off"
   }
